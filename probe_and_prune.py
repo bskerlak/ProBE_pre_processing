@@ -7,6 +7,7 @@ import rasterio
 import numpy as np
 import geopandas as gpd
 import configparser
+import shutil
 
 from pathlib import Path
 from shapely.geometry import Point
@@ -63,9 +64,9 @@ class AvaFrameAnrissManager:
         radius = math.sqrt(area / math.pi)
         circle = Point(x, y).buffer(radius, quad_segs=16)  # 4x16 = 64 Punkte für 1 Kreis
         gdf = gpd.GeoDataFrame([{'geometry': circle, 'id': 'rel_0'}], crs="EPSG:2056")
-        gdf.to_file(rel_dir / f"ReleaseX{x}Y{y}A{area}m2.shp")
+        gdf.to_file(rel_dir / f"AnrissX{x}Y{y}A{area}.shp")
 
-    def get_flow_bounds(self, result_ascii, buffer_m=100):
+    def get_flow_bounds(self, result_ascii, safety_buffer=100):
         """
         The Trim: Reads the simulation result and finds the actual used extent.
         """
@@ -79,33 +80,40 @@ class AvaFrameAnrissManager:
             
             # Convert pixel indices back to coordinates
             # rasterio.transform * (col, row) gives (x, y)
-            xs, ys = rasterio.transform.xy(src.transform, rows, cols)
-            
+            xs, ys = rasterio.transform.xy(src.transform, rows, cols, offset='ul')
+            res = src.res[0] # 5.0
+            # xs are the LEFT edges of the pixels
+            # ys are the TOP edges of the pixels
+            tight_left   = min(xs)
+            tight_right  = max(xs) + res # Add one cell to cover the full width
+            tight_top    = max(ys)
+            tight_bottom = min(ys) - res # Subtract one cell to reach the LL corner
+                        
             # Return tight bounds with safety buffer
             return [
-                min(xs) - buffer_m, # min_x
-                min(ys) - buffer_m, # min_y
-                max(xs) + buffer_m, # max_x
-                max(ys) + buffer_m  # max_y
+                tight_left - safety_buffer, # min_x
+                tight_bottom - safety_buffer, # min_y
+                tight_right + safety_buffer, # max_x
+                tight_top + safety_buffer  # max_y
             ]
         
-    def _bounds_to_geopackage(self, bounds, output_file):
+    def _extent_to_geopackage(self, extent, output_file):
         """
-        Converts bounds to a GeoPackage and overwrites any existing file.
-        bounds order: [min_x, min_y, max_x, max_y]
+        Converts extent to a GeoPackage and overwrites any existing file.
+        extent order: [min_x, min_y, max_x, max_y]
         """
         # Ensure output_file is a Path object for clean handling
         output_path = Path(output_file)
         
         # 1. Create the bounding box geometry
-        geom = box(float(bounds[0]), float(bounds[1]), float(bounds[2]), float(bounds[3]))
+        geom = box(extent[0], extent[1], extent[2], extent[3])
         
         # 2. Build the GeoDataFrame
         gdf = gpd.GeoDataFrame(
             {
-                'release_x': [float(bounds[0] + (bounds[2]-bounds[0])/2)],
-                'release_y': [float(bounds[1] + (bounds[3]-bounds[1])/2)],
-                'area_m2': [float((bounds[2] - bounds[0]) * (bounds[3] - bounds[1]))]
+                'center_x': [float(extent[0] + (extent[2]-extent[0])/2)],
+                'center_y': [float(extent[1] + (extent[3]-extent[1])/2)],
+                'area_m2': [float((extent[2] - extent[0]) * (extent[3] - extent[1]))]
             }, 
             geometry=[geom], 
             crs="EPSG:2056"
@@ -124,6 +132,33 @@ class AvaFrameAnrissManager:
             
         print(f"📥 Bounding box saved to GeoPackage: {output_file.name}")
 
+    def finalize_extent(self, extent, grid_size=5):
+        """
+        Validates that extent coordinates are nearly integers, snaps to grid, 
+        and converts to pure Python ints.
+        """
+        int_extent = []
+        
+        for val in extent:
+            # 1. Check if the float is 'essentially' an integer
+            # atol=1e-5 handles sub-millimeter floating point drift
+            if not np.isclose(val, np.round(val), atol=1e-5):
+                raise ValueError(f"Coordinate {val} has significant decimal noise and is not a whole number!")
+                
+            # 2. Convert to rounded integer
+            rounded_val = int(np.round(val))
+            
+            # 3. Assert grid alignment (Multiple of 5)
+            assert rounded_val % grid_size == 0, f"Value {rounded_val} is an integer but not aligned to the {grid_size}m grid!"
+            
+            int_extent.append(rounded_val)
+
+        # 4. Final Geometry Check
+        min_x, min_y, max_x, max_y = int_extent
+        assert max_x > min_x and max_y > min_y, "Bounding box has zero or negative area!"
+        
+        return int_extent
+
     def run_probe_and_prepare(self, x, y):
         """
         The Full Workflow:
@@ -133,7 +168,7 @@ class AvaFrameAnrissManager:
         """
         # --- 1. THE PROBE ---
         worst_case_area = self.worst_case_parameters['area']
-        probe_path = self.base_path / f"probe_X{int(x)}_Y{int(y)}_A{worst_case_area}m2"
+        probe_path = self.base_path / f"ProbeAnrissX{int(x)}Y{int(y)}A{worst_case_area}"
         input_dir = self.setup_dirs(probe_path)
         
         # Copy template config
@@ -185,19 +220,21 @@ class AvaFrameAnrissManager:
             raise RuntimeError(f"Could not contain avalanche even at {max_buffer}m buffer.")
                 
         # --- 2. THE TRIM ---
-        # Assuming peak pressure file 'pp.asc' is generated in Outputs
+        # Assuming peak flow depth file '*pft.asc' is generated in Outputs
         matches = list(Path(probe_path / "Outputs" / "com1DFA" / "peakFiles").glob("*_pft.asc"))
+        assert len(matches) == 1, "Too many or no *_pft.asc file(s)"
         result_pft_file = matches[0]
         tight_extent = self.get_flow_bounds(result_pft_file)
+        tight_extent_int = self.finalize_extent(tight_extent)
         
-        print(f"✂️ Tight Extent calculated: {tight_extent}")
+        print(f"✂️ Tight Extent calculated: {tight_extent_int}")
         tight_extent_path = Path(probe_path / "Outputs" / "com1DFA" / "tight_extent")
-        self._bounds_to_geopackage(tight_extent, tight_extent_path)
-        return tight_extent
+        self._extent_to_geopackage(tight_extent_int, tight_extent_path)
+        return tight_extent_int
 
 if __name__ == "__main__":
     # Settings
-    MASTER_TIF = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned.tif"
+    BERN_DEM_5M = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned.tif"
     CONFIG_TEMPLATE = "/home/bojan/probe_pre_processing/cfgCom1DFA_template.ini"
     SIMULATION_DATA_ROOT_DIR = "/home/bojan/probe_data/bern"
 
@@ -227,27 +264,45 @@ if __name__ == "__main__":
     rel_x, rel_y = 2608200, 1145230
     
     # AvaFrame Anriss Manager: Braucht Kanton BE DEM, Config Template und Output Directory
-    manager = AvaFrameAnrissManager(MASTER_TIF, CONFIG_TEMPLATE, SIMULATION_DATA_ROOT_DIR, worst_case_parameters)
+    manager = AvaFrameAnrissManager(BERN_DEM_5M, CONFIG_TEMPLATE, SIMULATION_DATA_ROOT_DIR, worst_case_parameters)
     
-    # 1. Run the Probe ("worst case" simulation) and get the tight bounds
-    production_extent = manager.run_probe_and_prepare(rel_x, rel_y)
-    
-    # 2. Setup Production run (using the tight extent)
-    for area in parameters["area"]:
-        mod_dir_name = f"AnrissX{rel_x}Y{rel_y}Area{area}m2"
+    # 1. Define a path for the 'Master' DEM for this specific coordinate
+    # We use the rel_x and rel_y in the filename to keep it unique
+    master_dem_name = f"production_dem_X{rel_x}_Y{rel_y}.asc"
+    master_dem_path = Path(SIMULATION_DATA_ROOT_DIR) / "cache_dems" / master_dem_name
+    master_dem_path.parent.mkdir(exist_ok=True)
 
-        prod_path = Path(Path(SIMULATION_DATA_ROOT_DIR) / mod_dir_name)
-        p_input = manager.setup_dirs(prod_path)
-        manager.extract_dem(p_input / "dem.asc", production_extent)
+    # 2. Calculate tight "worst case" extent and extract DEM only if it doesn't exist
+    if not master_dem_path.exists():
+        print(f"🌍 Extracting new Master DEM for {rel_x}/{rel_y}...")
+        # Run the Probe ("worst case" simulation) and get the tight bounds for this release circle center coordinate (same for all areas)
+        production_extent = manager.run_probe_and_prepare(rel_x, rel_y)
+        manager.extract_dem(master_dem_path, production_extent)
+    else:
+        print(f"📦 Using cached Master DEM for {rel_x}/{rel_y}")
+    
+    # 3. Distribute DEM to production folders & setup input folders
+    for area in parameters["area"]:
+        mod_dir_name = f"AnrissX{rel_x}Y{rel_y}Area{area}"
+        mod_dir_path = Path(Path(SIMULATION_DATA_ROOT_DIR) / mod_dir_name)
+        p_input = manager.setup_dirs(mod_dir_path)
+        
+        # copy already extracted master DEM for this (x/y)
+        shutil.copy2(master_dem_path, p_input)
+        
+        # create release polygon from circle center and area
         manager.create_release(p_input / "REL", rel_x, rel_y, area)
     
-        print(f"✅ Production DEM optimized and ready at {prod_path}")
+        print(f"✅ Production DEM and input folders ready at {mod_dir_path}")
 
     # 3. Cleanup (remove probe)
-    cleanup = False
+    cleanup = True
     if cleanup:
-        probe_path = Path(SIMULATION_DATA_ROOT_DIR) / f"probe_X{int(rel_x)}_Y{int(rel_y)}_A{int(worst_case_parameters["area"])}m2"
+        probe_path = Path(SIMULATION_DATA_ROOT_DIR) / f"ProbeAnrissX{int(rel_x)}Y{int(rel_y)}A{int(worst_case_parameters["area"])}"
         if probe_path.exists() and probe_path.is_dir():
             print(f"🧹 Cleaning up directory: {probe_path}")
             shutil.rmtree(probe_path)
+        xml_sidecar = master_dem_path.with_name(master_dem_path.name + ".aux.xml")
+        if xml_sidecar.exists():
+            xml_sidecar.unlink()
         # note that the results will be kept so we don't have to re-calculate the "worst case" again
