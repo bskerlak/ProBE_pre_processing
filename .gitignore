@@ -1,0 +1,10 @@
+# Bojan
+*tif
+*aux.xml
+*geojson
+*.nc
+*.parquet
+*gdb
+data/swissboundaries
+*.asc
+*.prj
