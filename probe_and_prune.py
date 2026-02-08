@@ -115,7 +115,7 @@ class AvaFrameAnrissManager:
         # 3. Force overwrite with the GPKG driver
         # We use engine='fiona' here because it is more direct about file handles
         gdf.to_file(
-            str(output_path), 
+            f"{output_path}.gpkg", 
             driver="GPKG", 
             layer="tight_extent", 
             mode="w", 
@@ -191,7 +191,7 @@ class AvaFrameAnrissManager:
         tight_extent = self.get_flow_bounds(result_pft_file)
         
         print(f"✂️ Tight Extent calculated: {tight_extent}")
-        tight_extent_path = Path(probe_path / "Outputs" / "com1DFA" / "tight_extent.gpkg")
+        tight_extent_path = Path(probe_path / "Outputs" / "com1DFA" / "tight_extent")
         self._bounds_to_geopackage(tight_extent, tight_extent_path)
         return tight_extent
 
@@ -224,6 +224,7 @@ if __name__ == "__main__":
    
     # Release Coordinates (LV95)
     rel_x, rel_y = 2631000, 1161000
+    rel_x, rel_y = 2608200, 1145230
     
     # AvaFrame Anriss Manager: Braucht Kanton BE DEM, Config Template und Output Directory
     manager = AvaFrameAnrissManager(MASTER_TIF, CONFIG_TEMPLATE, SIMULATION_DATA_ROOT_DIR, worst_case_parameters)
