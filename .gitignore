@@ -8,3 +8,4 @@
 data/swissboundaries
 *.asc
 *.prj
+data/simulation_inputs

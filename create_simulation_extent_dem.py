@@ -42,7 +42,7 @@ def extract_simulation_extent_dem(master_tif, output_ascii, min_x, min_y, max_x,
 if __name__ == "__main__":
     # Example: A 2km x 2km area near Interlaken/Bern region
     MASTER_DEM = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned.tif"
-    OUTPUT_FILE = "/home/bojan/probe_pre_processing/data/simulation_dem/sim_zone_A1.asc"
+    OUTPUT_FILE = "/home/bojan/probe_pre_processing/data/simulation_dems/sim_zone_A1.asc"
     
     extract_simulation_extent_dem(
         MASTER_DEM, 
