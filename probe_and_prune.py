@@ -132,7 +132,8 @@ class AvaFrameAnrissManager:
         3. Define Production Extent
         """
         # --- 1. THE PROBE ---
-        probe_path = self.base_path / f"probe_{int(x)}_{int(y)}"
+        worst_case_area = self.worst_case_parameters['area']
+        probe_path = self.base_path / f"probe_X{int(x)}_Y{int(y)}_A{worst_case_area}m2"
         input_dir = self.setup_dirs(probe_path)
         
         # Copy template config
@@ -144,7 +145,7 @@ class AvaFrameAnrissManager:
 
         while not simulation_successful and buffer <= max_buffer:
 
-            print(f"Creating buffer {buffer}m")
+            print(f"Creating buffer +-{buffer}m")
             probe_extent = [x-buffer, y-buffer, x+buffer, y+buffer]
         
             self.extract_dem(input_dir / "dem.asc", probe_extent)
@@ -177,7 +178,7 @@ class AvaFrameAnrissManager:
                 print(f"Simulation successful at buffer +-{buffer}m = {buffer*2/1000}km x {buffer*2/1000}km  - took {time_needed_total}s")
                 simulation_successful = True
             except ValueError as e:
-                print("ERROR: Particles left the domain --> Next buffer")
+                print("⚠️error⚠️: Particles left the domain --> Next buffer")
                 buffer += 500
 
         if not simulation_successful:
@@ -198,6 +199,7 @@ if __name__ == "__main__":
     # Settings
     MASTER_TIF = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned.tif"
     CONFIG_TEMPLATE = "/home/bojan/probe_pre_processing/cfgCom1DFA_template.ini"
+    SIMULATION_DATA_ROOT_DIR = "/home/bojan/probe_data/bern"
 
     # Parameters
     # default Pro-Mo parameter (from 2024; 3 Anrissflächen und 54 = 3*3*2*3 Parameter)
@@ -224,15 +226,27 @@ if __name__ == "__main__":
     rel_x, rel_y = 2631000, 1161000
     
     # AvaFrame Anriss Manager: Braucht Kanton BE DEM, Config Template und Output Directory
-    manager = AvaFrameAnrissManager(MASTER_TIF, CONFIG_TEMPLATE, "./ava_sims", worst_case_parameters)
+    manager = AvaFrameAnrissManager(MASTER_TIF, CONFIG_TEMPLATE, SIMULATION_DATA_ROOT_DIR, worst_case_parameters)
     
-    # 1. Run the Probe and get the tight bounds
+    # 1. Run the Probe ("worst case" simulation) and get the tight bounds
     production_extent = manager.run_probe_and_prepare(rel_x, rel_y)
     
     # 2. Setup Production run (using the tight extent)
-    # This DEM will be much smaller and faster to simulate
-    prod_path = Path("./ava_sims/production_batch")
-    p_input = manager.setup_dirs(prod_path)
-    manager.extract_dem(p_input / "dem.asc", production_extent)
+    for area in parameters["area"]:
+        mod_dir_name = f"AnrissX{rel_x}Y{rel_y}Area{area}m2"
+
+        prod_path = Path(Path(SIMULATION_DATA_ROOT_DIR) / mod_dir_name)
+        p_input = manager.setup_dirs(prod_path)
+        manager.extract_dem(p_input / "dem.asc", production_extent)
+        manager.create_release(p_input / "REL", rel_x, rel_y, area)
     
-    print(f"✅ Production DEM optimized and ready at {prod_path}")
+        print(f"✅ Production DEM optimized and ready at {prod_path}")
+
+    # 3. Cleanup (remove probe)
+    cleanup = False
+    if cleanup:
+        probe_path = Path(SIMULATION_DATA_ROOT_DIR) / f"probe_X{int(rel_x)}_Y{int(rel_y)}_A{int(worst_case_parameters["area"])}m2"
+        if probe_path.exists() and probe_path.is_dir():
+            print(f"🧹 Cleaning up directory: {probe_path}")
+            shutil.rmtree(probe_path)
+        # note that the results will be kept so we don't have to re-calculate the "worst case" again
