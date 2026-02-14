@@ -6,6 +6,7 @@ import csv
 import ray
 import itertools
 import time
+from tqdm import tqdm
 from datetime import datetime
 from pathlib import Path
 import numpy as np
@@ -61,6 +62,7 @@ class AvaFrameAnrissManager:
                     max(xs) + res + safety_buffer, max(ys) + safety_buffer]
 
     def run_lead_sim(self, x, y):
+        print(f"🚀 Running lead simulation for ({x}, {y})")
         p = self.worst_case_parameters
         sim_id = f"X{x}_Y{y}_A{p['area']}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
         sim_path = self.results_base_path / f"Sim_{sim_id}"
@@ -94,29 +96,59 @@ class AvaFrameAnrissManager:
 
         matches = list((sim_path / "Outputs" / "com1DFA" / "peakFiles").glob("*_pft.asc"))
         tight_extent = self.get_flow_bounds(matches[0])
+        print(f"✂️ Tight Extent calculated: {tight_extent} - needed buffer: {buffer}")
         return [int(np.round(v // 5 * 5)) for v in tight_extent], buffer
 
     def create_max_depth_raster(self, x, y, sim_paths, output_path):
-        """Stacks all peak flow thickness rasters and computes the pixel-wise maximum."""
+        """Stacks all peak flow thickness rasters, aligning them to a common master grid."""
+        import rasterio
+        from rasterio.warp import reproject, Resampling
+        
         max_data = None
-        profile = None
+        master_profile = None
+        master_transform = None
+        master_width = None
+        master_height = None
 
         for path in sim_paths:
             matches = list(Path(path / "Outputs" / "com1DFA" / "peakFiles").glob("*_pft.asc"))
-            if not matches: continue
+            if not matches:
+                continue
             
             with rasterio.open(matches[0]) as src:
-                data = src.read(1)
+                # First file encountered sets the 'Master' geometry (usually the Lead Sim)
                 if max_data is None:
-                    max_data = data
-                    profile = src.profile
-                    profile.update(driver='GTiff', dtype='float32', count=1, compress='lzw')
+                    max_data = src.read(1)
+                    master_profile = src.profile.copy()
+                    master_transform = src.transform
+                    master_width = src.width
+                    master_height = src.height
+                    # Update profile for GeoTIFF output
+                    master_profile.update(driver='GTiff', dtype='float32', count=1, compress='lzw')
                 else:
-                    max_data = np.maximum(max_data, data)
+                    current_data = src.read(1)
+                    
+                    # Check if dimensions match; if not, reproject into the master grid
+                    if current_data.shape != max_data.shape:
+                        # Initialize an empty array of the master's size
+                        aligned_data = np.zeros((master_height, master_width), dtype='float32')
+                        
+                        reproject(
+                            source=current_data,
+                            destination=aligned_data,
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            dst_transform=master_transform,
+                            dst_crs=master_profile['crs'],
+                            resampling=Resampling.nearest
+                        )
+                        max_data = np.maximum(max_data, aligned_data)
+                    else:
+                        max_data = np.maximum(max_data, current_data)
 
         if max_data is not None:
             output_path.parent.mkdir(exist_ok=True, parents=True)
-            with rasterio.open(output_path, 'w', **profile) as dst:
+            with rasterio.open(output_path, 'w', **master_profile) as dst:
                 dst.write(max_data, 1)
             return True
         return False
@@ -193,25 +225,60 @@ if __name__ == "__main__":
     DEM = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned_5km_buffer_COG_cropped.tif"
     TEMPLATE = "/home/bojan/probe_pre_processing/cfgCom1DFA_template.ini"
     ROOT = "/home/bojan/probe_data/bern"
+    LOG_FILE = Path(ROOT) / f"log_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     
+    # Define and Sort Parameters
     raw_params = {
         'area': [200, 400, 1500],
         'relTh': [0.75, 1, 3],
         'mu': [0.05, 0.25, 0.375],
         'xsi': [200, 600, 1250],
-        'tau0': [500, 1500]}
-    sorted_params = {k: sorted(v, reverse=(k != 'mu' and k != 'tau0')) for k, v in raw_params.items()}
+        'tau0': [500, 1500],
+    }
+    # Sorting ensures index [0] is always the "Worst Case" Lead Sim
+    sorted_params = {
+        'area': sorted(raw_params['area'], reverse=True),
+        'relTh': sorted(raw_params['relTh'], reverse=True),
+        'mu': sorted(raw_params['mu']),
+        'xsi': sorted(raw_params['xsi'], reverse=True),
+        'tau0': sorted(raw_params['tau0']),
+    }
 
-    ray.init()
+    # --- 2. INITIALIZE RAY ---
+    if not ray.is_initialized():
+        ray.init()
+
+    # --- 3. PREPARE TASKS ---
     gdf = gpd.read_file(Path(ROOT) / "locations_random_1000.gpkg")
-    locations = [(int(p.x), int(p.y)) for p in gdf.geometry][:10]
+    # Define tasks here so it's accessible
+    tasks = [(idx, int(p.x), int(p.y)) for idx, p in enumerate(gdf.geometry)]
+    tasks = tasks[:10]  # Limit for testing
 
-    workers = [AvaFrameBatchWorker.remote(DEM, TEMPLATE, ROOT, sorted_params) for _ in range(int(ray.available_resources().get("CPU", 4)))]
+    # --- 4. SETUP WORKERS ---
+    n_workers = int(ray.available_resources().get("CPU", 4))
+    workers = [AvaFrameBatchWorker.remote(DEM, TEMPLATE, ROOT, sorted_params) for _ in range(n_workers)]
     pool = ActorPool(workers)
-    
-    with open(Path(ROOT) / "simulation_log.csv", 'w', newline='') as f:
+
+    print(f"🚀 Starting processing for {len(tasks)} locations using {n_workers} workers.")
+
+    # --- 5. EXECUTION WITH TQDM ---
+    with open(LOG_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
+        # Detailed Header
         writer.writerow(['idx', 'x', 'y', 'area', 'relTh', 'mu', 'xsi', 'tau0', 'status', 'error'])
-        tasks = [(idx, x, y) for idx, (x, y) in enumerate(locations)]
-        for batch_res in pool.map_unordered(lambda a, v: a.process_batch.remote([v]), tasks):
-            for row in batch_res: writer.writerow(row)
+
+        with tqdm(total=len(tasks), desc="Avalanche Locations", unit="loc", dynamic_ncols=True) as pbar:
+            # map_unordered yields results as soon as any worker is done
+            # We pass [v] so each worker takes exactly one location task
+            for batch_results in pool.map_unordered(lambda a, v: a.process_batch.remote([v]), tasks):
+                for row in batch_results:
+                    writer.writerow(row)
+                    
+                    # Log errors to terminal without breaking the bar
+                    if "FAIL" in str(row[8]) or "ERROR" in str(row[8]):
+                        pbar.write(f"⚠️  Task {row[0]} failed: {row[9]}")
+                
+                f.flush() # Ensure data is written to disk frequently
+                pbar.update(1)
+
+    print(f"🏁 Done! MaxDepth TIFFs are in 'merged_results' and log is at {LOG_FILE}")
