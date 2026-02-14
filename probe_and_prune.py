@@ -8,6 +8,8 @@ import numpy as np
 import geopandas as gpd
 import configparser
 import shutil
+import csv
+import random
 
 from pathlib import Path
 from shapely.geometry import Point
@@ -15,6 +17,7 @@ from shapely.geometry import box
 
 import avaframe
 from avaframe.com1DFA import com1DFA
+import time
 
 class AvaFrameAnrissManager:
     def __init__(self, master_dem_path, config_template_path, base_path, worst_case_parameters):
@@ -174,11 +177,13 @@ class AvaFrameAnrissManager:
         # Copy template config
         shutil.copy(self.config_template_path, input_dir / "CONFIG" / "cfgCom1DFA.ini")
         
-        buffer = 500
+        buffer_init = 1000
+        buffer_increment = 500
+        buffer_max = 10000  # Safety cap at 20km width
+        buffer = buffer_init
         simulation_successful = False
-        max_buffer = 10000  # Safety cap at 20km width
 
-        while not simulation_successful and buffer <= max_buffer:
+        while not simulation_successful and buffer <= buffer_max:
 
             print(f"Creating buffer +-{buffer}m")
             probe_extent = [x-buffer, y-buffer, x+buffer, y+buffer]
@@ -217,7 +222,7 @@ class AvaFrameAnrissManager:
                 buffer += 500
 
         if not simulation_successful:
-            raise RuntimeError(f"Could not contain avalanche even at {max_buffer}m buffer.")
+            raise RuntimeError(f"Could not contain avalanche even at {buffer_max}m buffer.")
                 
         # --- 2. THE TRIM ---
         # Assuming peak flow depth file '*pft.asc' is generated in Outputs
@@ -230,13 +235,16 @@ class AvaFrameAnrissManager:
         print(f"✂️ Tight Extent calculated: {tight_extent_int}")
         tight_extent_path = Path(probe_path / "Outputs" / "com1DFA" / "tight_extent")
         self._extent_to_geopackage(tight_extent_int, tight_extent_path)
-        return tight_extent_int
+        # also return the buffer that was required to contain the simulation
+        return tight_extent_int, buffer
 
 if __name__ == "__main__":
     # Settings
-    BERN_DEM_5M = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned.tif"
+    BERN_DEM_5M = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned_5km_buffer_COG_cropped.tif"
     CONFIG_TEMPLATE = "/home/bojan/probe_pre_processing/cfgCom1DFA_template.ini"
     SIMULATION_DATA_ROOT_DIR = "/home/bojan/probe_data/bern"
+    PERFORMANCE_LOG = Path(SIMULATION_DATA_ROOT_DIR) / "performance_log.csv"
+    NUM_SAMPLES = 10
 
     # Parameters
     # default Pro-Mo parameter (from 2024; 3 Anrissflächen und 54 = 3*3*2*3 Parameter)
@@ -259,50 +267,98 @@ if __name__ == "__main__":
         'tau0': min(parameters['tau0']),
     }
    
-    # Release Coordinates (LV95)
-    rel_x, rel_y = 2631000, 1161000
-    rel_x, rel_y = 2608200, 1145230
-    
     # AvaFrame Anriss Manager: Braucht Kanton BE DEM, Config Template und Output Directory
     manager = AvaFrameAnrissManager(BERN_DEM_5M, CONFIG_TEMPLATE, SIMULATION_DATA_ROOT_DIR, worst_case_parameters)
     
-    # 1. Define a path for the 'Master' DEM for this specific coordinate
-    # We use the rel_x and rel_y in the filename to keep it unique
-    master_dem_name = f"production_dem_X{rel_x}_Y{rel_y}.asc"
-    master_dem_path = Path(SIMULATION_DATA_ROOT_DIR) / "cache_dems" / master_dem_name
-    master_dem_path.parent.mkdir(exist_ok=True)
+    # 1. Generate Random Locations
+    print(f"🎲 Generating {NUM_SAMPLES} random locations in Kanton Bern...")
+    locations = []
+    with rasterio.open(BERN_DEM_5M) as src:
+        bounds = src.bounds
+        nodata = src.nodata
+        while len(locations) < NUM_SAMPLES:
+            rx = random.uniform(bounds.left, bounds.right)
+            ry = random.uniform(bounds.bottom, bounds.top)
+            # Check if valid (not NoData)
+            try:
+                val = next(src.sample([(rx, ry)]))[0]
+                if val != nodata and val > -9999:
+                    locations.append((int(rx), int(ry)))
+            except Exception:
+                continue
 
-    # 2. Calculate tight "worst case" extent and extract DEM only if it doesn't exist
-    if not master_dem_path.exists():
-        print(f"🌍 Extracting new Master DEM for {rel_x}/{rel_y}...")
-        # Run the Probe ("worst case" simulation) and get the tight bounds for this release circle center coordinate (same for all areas)
-        production_extent = manager.run_probe_and_prepare(rel_x, rel_y)
-        manager.extract_dem(master_dem_path, production_extent)
-    else:
-        print(f"📦 Using cached Master DEM for {rel_x}/{rel_y}")
-    
-    # 3. Distribute DEM to production folders & setup input folders
-    for area in parameters["area"]:
-        mod_dir_name = f"AnrissX{rel_x}Y{rel_y}Area{area}"
-        mod_dir_path = Path(Path(SIMULATION_DATA_ROOT_DIR) / mod_dir_name)
-        p_input = manager.setup_dirs(mod_dir_path)
-        
-        # copy already extracted master DEM for this (x/y)
-        shutil.copy2(master_dem_path, p_input)
-        
-        # create release polygon from circle center and area
-        manager.create_release(p_input / "REL", rel_x, rel_y, area)
-    
-        print(f"✅ Production DEM and input folders ready at {mod_dir_path}")
+    # Initialize CSV
+    with open(PERFORMANCE_LOG, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['idx', 'x', 'y', 'probe_time_s', 'extract_time_s', 'total_time_s', 'extent_area_m2', 'buffer_m', 'status', 'error'])
 
-    # 3. Cleanup (remove probe)
-    cleanup = True
-    if cleanup:
-        probe_path = Path(SIMULATION_DATA_ROOT_DIR) / f"ProbeAnrissX{int(rel_x)}Y{int(rel_y)}A{int(worst_case_parameters["area"])}"
-        if probe_path.exists() and probe_path.is_dir():
-            print(f"🧹 Cleaning up directory: {probe_path}")
-            shutil.rmtree(probe_path)
-        xml_sidecar = master_dem_path.with_name(master_dem_path.name + ".aux.xml")
-        if xml_sidecar.exists():
-            xml_sidecar.unlink()
-        # note that the results will be kept so we don't have to re-calculate the "worst case" again
+    print(f"🚀 Starting batch processing of {len(locations)} locations.")
+
+    for idx, (rel_x, rel_y) in enumerate(locations):
+        print(f"\n--- Run {idx+1}/{NUM_SAMPLES} @ ({rel_x}, {rel_y}) ---")
+        
+        t_start = time.perf_counter()
+        status = "SUCCESS"
+        error_msg = ""
+        probe_time = 0
+        extract_time = 0
+        extent_area = 0
+        buffer_used = ""
+        
+        try:
+            # 2. Define paths
+            master_dem_name = f"production_dem_X{rel_x}_Y{rel_y}.asc"
+            master_dem_path = Path(SIMULATION_DATA_ROOT_DIR) / "cache_dems" / master_dem_name
+            master_dem_path.parent.mkdir(exist_ok=True)
+
+            # 3. Run Probe
+            t0 = time.perf_counter()
+            production_extent, buffer_used = manager.run_probe_and_prepare(rel_x, rel_y)
+            t1 = time.perf_counter()
+            probe_time = t1 - t0
+            
+            # Calculate Area
+            width = production_extent[2] - production_extent[0]
+            height = production_extent[3] - production_extent[1]
+            extent_area = width * height
+
+            # 4. Extract DEM
+            t2 = time.perf_counter()
+            manager.extract_dem(master_dem_path, production_extent)
+            t3 = time.perf_counter()
+            extract_time = t3 - t2
+            
+            # 5. Create Production Folders (and cleanup immediately for perf test)
+            for area in parameters["area"]:
+                mod_dir_name = f"AnrissX{rel_x}Y{rel_y}Area{area}"
+                mod_dir_path = Path(SIMULATION_DATA_ROOT_DIR) / mod_dir_name
+                p_input = manager.setup_dirs(mod_dir_path)
+                shutil.copy2(master_dem_path, p_input)
+                manager.create_release(p_input / "REL", rel_x, rel_y, area)
+                # Cleanup production folder immediately to save space
+                shutil.rmtree(mod_dir_path)
+            
+            # Cleanup Probe
+            probe_path = Path(SIMULATION_DATA_ROOT_DIR) / f"ProbeAnrissX{int(rel_x)}Y{int(rel_y)}A{int(worst_case_parameters['area'])}"
+            if probe_path.exists():
+                shutil.rmtree(probe_path)
+                
+            # Cleanup Cached DEM
+            if master_dem_path.exists():
+                master_dem_path.unlink()
+            xml_sidecar = master_dem_path.with_name(master_dem_path.name + ".aux.xml")
+            if xml_sidecar.exists():
+                xml_sidecar.unlink()
+
+        except Exception as e:
+            status = "FAIL"
+            error_msg = str(e)
+            print(f"❌ Failed: {e}")
+        
+        t_end = time.perf_counter()
+        total_time = t_end - t_start
+        
+        # Log
+        with open(PERFORMANCE_LOG, 'a', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([idx, rel_x, rel_y, f"{probe_time:.2f}", f"{extract_time:.2f}", f"{total_time:.2f}", extent_area, buffer_used, status, error_msg])
