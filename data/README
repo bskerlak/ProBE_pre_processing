@@ -1,7 +1,10 @@
-downloaded from https://www.swisstopo.admin.ch/en/height-model-swissalti3d
-2m resolution
-LV95
-time status = current
+# ProBE Pre-Processing
 
-selection by canton
-Bern
+**ProBE_pre_processing** downloads a large rectangle from swissalti3d and the cantonal boundaries from swissboundaries. It downloads 2m tiles (COG), converts to 5m by averaging and clips to the polygon boundaries with a buffer of 5000m.
+
+## 🚀 Features
+
+*   **Raw DEM Data:** 2m DEM from SwissALTI3D
+*   **BE Boundary Data:** SwissBOUNDARIES
+*   **Downsampling:** 2m to 5m by averaging. Ensuring grid snaps to 5m values.
+*   **Buffer:** 5km buffer around BE Polygon to ensure capturing landslides coming into BE from outsides.
