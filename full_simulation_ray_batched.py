@@ -34,7 +34,7 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
         # Yield a single batch containing only the target coordinate
         # The structure is a list of tuples: [(id, x, y)]
         print(f"🎯 Anriss0005Flag active: Yielding single test location (2608198, 1145230)")
-        yield [(0, 2608198, 1145230)]
+        yield [(0, 2608198, 1145230)] # Anriss0005 from all performance tests
         return # Stop the generator here
     
     con = duckdb.connect()
@@ -60,7 +60,7 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
 class AvaFrameAnrissManager:
     def __init__(self, master_dem_path, config_template_path, root_path, worst_case_parameters):
         self.master_dem_path = master_dem_path
-        self.results_base_path = Path(root_path) / "results"
+        self.simulation_base_path = Path(root_path) / "Simulations"
         self.config_template_path = config_template_path
         self.worst_case_parameters = worst_case_parameters
         self.os_env = os.environ.copy()
@@ -103,7 +103,8 @@ class AvaFrameAnrissManager:
         start_tc = time.perf_counter()
         print(f"🚀 Running lead simulation for ({x}, {y})")
         p = self.worst_case_parameters
-        sim_path = self.results_base_path / f"Sim_X{x}_Y{y}_A{p['area']}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
+        # TODO skip lead simulation if DEM already present
+        sim_path = self.simulation_base_path / f"Sim_X{x}_Y{y}_A{p['area']}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
         input_dir = self.setup_dirs(sim_path)
         
         shutil.copy(self.config_template_path, input_dir / "CONFIG" / "cfgCom1DFA.ini")
@@ -289,6 +290,7 @@ if __name__ == "__main__":
     SIM_ROOT = "/home/bojan/probe_data/bern"
     LOCATIONS = "/home/bojan/probe_data/bern/locations_random_1000.gpkg"
     LOG_FILE = Path(SIM_ROOT) / f"log_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    RAY_MODE = "local_debug"
     N_RAY_WORKERS = 8
     N_LIMIT_LOCATIONS = 1
 
@@ -320,7 +322,10 @@ if __name__ == "__main__":
     # Initialize Ray Cluster
     print("Initializing Ray Cluster...")
     if not ray.is_initialized():
-        ray.init()
+        if RAY_MODE == "local_debug":
+            ray.init(local_mode=True)
+        elif RAY_MODE == "local_cluster":
+            ray.init()
 
     # N_RAY_WORKERS = int(ray.available_resources().get("CPU", 4))
     print(f"Setting up {N_RAY_WORKERS} Ray Workers ...")
