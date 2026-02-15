@@ -258,6 +258,8 @@ class AvaFrameAnrissManager:
             compress='lzw',
             tiled=False
             )
+        m_profile.pop('blockxsize')
+        m_profile.pop('blockysize')
 
         # Initialize accumulation arrays
         # Depth Stats
@@ -325,6 +327,7 @@ class AvaFrameAnrissManager:
             with rasterio.open(raster_output_dir / name, 'w', **m_profile) as dst:
                 dst.write(data, 1)
 
+@ray.remote(num_cpus=1)
 class AvaFrameBatchWorker:
     def __init__(self, dem_path, config_template, root_dir, parameters):
         self.parameters = parameters
@@ -447,7 +450,7 @@ if __name__ == "__main__":
     RAY_MODE = "local_debug"
     N_RAY_WORKERS = 8
     N_LIMIT_LOCATIONS = 1
-    LOCAL_DEBUG_MODE = True
+    LOCAL_SINGLE_THREAD_DEBUG_MODE = False
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -484,9 +487,9 @@ if __name__ == "__main__":
     MAX_IN_FLIGHT = N_RAY_WORKERS * 2  # queue one task for every worker
     in_flight = 0
 
-    if LOCAL_DEBUG_MODE:
+    if LOCAL_SINGLE_THREAD_DEBUG_MODE:
         print("RUNNING IN DEBUG MODE WITHOUT RAY")
-        debug_worker = AvaFrameBatchWorker(BE_DEM_5M, CONFIG_TEMPLATE, SIM_ROOT, sorted_params)
+        debug_worker = AvaFrameBatchWorker.__wrapped__(BE_DEM_5M, CONFIG_TEMPLATE, SIM_ROOT, sorted_params)
         # Manually call the method
         test_location = [(0, 2608198, 1145230)]
         results = debug_worker.process_batch(test_location)
