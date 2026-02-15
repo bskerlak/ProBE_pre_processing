@@ -151,13 +151,12 @@ class AvaFrameAnrissManager:
         start_tc = time.perf_counter()
         print(f"🚀 Running lead simulation for ({x}, {y})")
         p = self.worst_case_parameters
-        # TODO skip lead simulation if DEM already present
         sim_path = self.simulation_base_path / f"Sim_X{x}_Y{y}_A{p['area']}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
         input_dir = self.setup_dirs(sim_path)
         
         shutil.copy(self.config_template_path, input_dir / "CONFIG" / "cfgCom1DFA.ini")
         
-        buffer, success = 1000, False
+        buffer, success = 1500, False
         buffer_delta = 500
 
         while not success and buffer <= 10000:
@@ -327,7 +326,6 @@ class AvaFrameAnrissManager:
             with rasterio.open(raster_output_dir / name, 'w', **m_profile) as dst:
                 dst.write(data, 1)
 
-@ray.remote(num_cpus=1)
 class AvaFrameBatchWorker:
     def __init__(self, dem_path, config_template, root_dir, parameters):
         self.parameters = parameters
@@ -385,13 +383,16 @@ class AvaFrameBatchWorker:
                 sim_start = time.perf_counter()
                 sim_path = self.simulation_base_path / f"Sim_X{x}_Y{y}_A{p['area']}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
                 
-                if p != self.worst_case_params:
+                #if p != self.worst_case_params:
+                if True:
                     try:
                         p_in = self.anriss_manager.setup_dirs(sim_path)
+
                         start_time = time.perf_counter()
                         shutil.copy2(DEM_worst_case_simulation_path, p_in / "dem.asc")
                         end_time = time.perf_counter()
                         logger.debug(f"      Copied DEM {DEM_worst_case_simulation_path} -> {p_in / 'dem.asc'} - took: {end_time - start_time:.4f} s")
+
                         start_time = time.perf_counter()
                         radius = math.sqrt(p['area'] / math.pi)
                         circle = Point(x, y).buffer(radius, quad_segs=16)
@@ -450,7 +451,7 @@ if __name__ == "__main__":
     RAY_MODE = "local_debug"
     N_RAY_WORKERS = 8
     N_LIMIT_LOCATIONS = 1
-    LOCAL_SINGLE_THREAD_DEBUG_MODE = False
+    LOCAL_SINGLE_THREAD_DEBUG_MODE = True
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -464,7 +465,7 @@ if __name__ == "__main__":
     # Simulation parameters
     #'area': [200, 400, 1500],
     raw_params = {
-        'area': [200],
+        'area': [200, 400, 1500],
         'relTh': [0.75, 1, 3],
         'mu': [0.05, 0.25, 0.375],
         'xsi': [200, 600, 1250],
@@ -487,11 +488,20 @@ if __name__ == "__main__":
     MAX_IN_FLIGHT = N_RAY_WORKERS * 2  # queue one task for every worker
     in_flight = 0
 
+    def create_worker(*args, **kwargs):
+        if LOCAL_SINGLE_THREAD_DEBUG_MODE:
+            return WorkerClass(*args, **kwargs)
+        else:
+            return WorkerClass.remote(*args, **kwargs)
+
     if LOCAL_SINGLE_THREAD_DEBUG_MODE:
         print("RUNNING IN DEBUG MODE WITHOUT RAY")
-        debug_worker = AvaFrameBatchWorker.__wrapped__(BE_DEM_5M, CONFIG_TEMPLATE, SIM_ROOT, sorted_params)
+        print("using AvaFrameBatchWorker directly, no remote, no ncpu")
+        WorkerClass = AvaFrameBatchWorker
         # Manually call the method
         test_location = [(0, 2608198, 1145230)]
+        test_location = [(0, 2608200, 1145235)]
+        debug_worker = create_worker(BE_DEM_5M, CONFIG_TEMPLATE, SIM_ROOT, sorted_params)
         results = debug_worker.process_batch(test_location)
         try:
             written = save_batch_to_csv(results, LOG_FILE)
@@ -514,7 +524,8 @@ if __name__ == "__main__":
 
     # N_RAY_WORKERS = int(ray.available_resources().get("CPU", 4))
     print(f"Setting up {N_RAY_WORKERS} Ray Workers ...")
-    workers = [AvaFrameBatchWorker.options(name=f"AvaFrameBatchWorker{i}").remote(BE_DEM_5M, CONFIG_TEMPLATE, SIM_ROOT, sorted_params) for i in range(N_RAY_WORKERS)]
+    WorkerClass = ray.remote(num_cpus=1)(AvaFrameBatchWorker)
+    workers = [create_worker(BE_DEM_5M, CONFIG_TEMPLATE, SIM_ROOT, sorted_params) for i in range(N_RAY_WORKERS)]
     pool = ActorPool(workers)
 
     # Run simulations
