@@ -1,24 +1,32 @@
 import os
 import sys
 import shutil
-import subprocess
+
+# math, GIS
 import math
-import ray
-import itertools
-import time
-import duckdb
-from tqdm import tqdm
-from datetime import datetime
-from pathlib import Path
 import numpy as np
-import rasterio
 import geopandas as gpd
+from shapely.geometry import Point
+import rasterio
+from rasterio.warp import reproject, Resampling
+
+# orchestration
+import duckdb
+import itertools
+import ray
+from ray.util.actor_pool import ActorPool
+import subprocess
+from tqdm import tqdm
+
+# logging, timing
 import configparser
 import csv
 import logging
-from shapely.geometry import Point
-from ray.util.actor_pool import ActorPool
+import time
+from pathlib import Path
+from datetime import datetime
 
+# AvaFrame
 import avaframe
 from avaframe.com1DFA import com1DFA
 
@@ -227,59 +235,95 @@ class AvaFrameAnrissManager:
         self.extract_ascii_raster_from_master_dem(dem_path, extent)
         return dem_path, extent, buffer
 
-    def create_max_depth_raster(self, x, y, sim_paths, output_path):
-        """Stacks all peak flow thickness rasters, aligning them to a common master grid."""
+    def create_stat_rasters(self, x, y, sim_paths, output_dir):
+        """
+        Stacks all rasters to calculate Max, Min, and Avg for both Depth and Velocity,
+        aligned to the cached DEM master grid.
+        """
         import rasterio
+        import numpy as np
         from rasterio.warp import reproject, Resampling
+
+        # 1. Anchor to Cached DEM
+        worst_case_str = "_".join([f"{k}{v}" for k, v in self.worst_case_parameters.items()])
+        dem_cache_path = self.root_path / f"DEM_cache_{worst_case_str}" / f"DEM_X{x}_Y{y}.asc"
+        with rasterio.open(dem_cache_path) as master_src:
+            m_trans = master_src.transform
+            m_width, m_height = master_src.width, master_src.height
+            m_profile = master_src.profile.copy()
         
-        max_data = None
-        master_profile = None
-        master_transform = None
-        master_width = None
-        master_height = None
+        m_profile.update(
+            driver='GTiff',
+            dtype='float32',
+            compress='lzw',
+            tiled=False
+            )
 
+        # Initialize accumulation arrays
+        # Depth Stats
+        max_d = np.zeros((m_height, m_width), dtype='float32')
+        min_d = np.full((m_height, m_width), np.inf, dtype='float32')
+        sum_d = np.zeros((m_height, m_width), dtype='float32')
+        
+        # Velocity Stats (assuming 'pfv' Peak Velocity files)
+        max_v = np.zeros((m_height, m_width), dtype='float32')
+        min_v = np.full((m_height, m_width), np.inf, dtype='float32')
+        sum_v = np.zeros((m_height, m_width), dtype='float32')
+
+        # Count of simulations that hit each pixel (for Avg)
+        count_mask = np.zeros((m_height, m_width), dtype='int32')
+
+        # 2. Process all simulation results
         for path in sim_paths:
-            matches = list(Path(path / "Outputs" / "com1DFA" / "peakFiles").glob("*_pft.asc"))
-            if not matches:
-                continue
+            # Find Depth (pft) and Velocity (pfv) files
+            pft_file = list(Path(path / "Outputs/com1DFA/peakFiles").glob("*_pft.asc"))
+            pfv_file = list(Path(path / "Outputs/com1DFA/peakFiles").glob("*_pfv.asc"))
             
-            with rasterio.open(matches[0]) as src:
-                # First file encountered sets the 'Master' geometry (usually the Lead Sim)
-                if max_data is None:
-                    max_data = src.read(1)
-                    master_profile = src.profile.copy()
-                    master_transform = src.transform
-                    master_width = src.width
-                    master_height = src.height
-                    # Update profile for GeoTIFF output
-                    master_profile.update(driver='GTiff', dtype='float32', count=1, compress='lzw')
-                else:
-                    current_data = src.read(1)
+            if not pft_file or not pfv_file: continue
+            
+            for file_path, current_sum, current_max, current_min in [
+                (pft_file[0], sum_d, max_d, min_d), 
+                (pfv_file[0], sum_v, max_v, min_v)
+            ]:
+                with rasterio.open(file_path) as src:
+                    aligned = np.zeros((m_height, m_width), dtype='float32')
+                    reproject(
+                        source=src.read(1), destination=aligned,
+                        src_transform=src.transform, src_crs="EPSG:2056",
+                        dst_transform=m_trans, dst_crs="EPSG:2056",
+                        resampling=Resampling.nearest
+                    )
                     
-                    # Check if dimensions match; if not, reproject into the master grid
-                    if current_data.shape != max_data.shape:
-                        # Initialize an empty array of the master's size
-                        aligned_data = np.zeros((master_height, master_width), dtype='float32')
-                        
-                        reproject(
-                            source=current_data,
-                            destination=aligned_data,
-                            src_transform=src.transform,
-                            src_crs=src.crs if src.crs else "EPSG:2056",
-                            dst_transform=master_transform,
-                            dst_crs=master_profile['crs'],
-                            resampling=Resampling.nearest
-                        )
-                        max_data = np.maximum(max_data, aligned_data)
-                    else:
-                        max_data = np.maximum(max_data, current_data)
+                    # Update Stats
+                    mask = aligned > 0
+                    current_max[mask] = np.maximum(current_max[mask], aligned[mask])
+                    current_min[mask] = np.minimum(current_min[mask], aligned[mask])
+                    current_sum[mask] += aligned[mask]
+                    
+                    # We only update the count mask once per simulation path (using Depth as proxy)
+                    if file_path == pft_file[0]:
+                        count_mask[mask] += 1
 
-        if max_data is not None:
-            output_path.parent.mkdir(exist_ok=True, parents=True)
-            with rasterio.open(output_path, 'w', **master_profile) as dst:
-                dst.write(max_data, 1)
-            return True
-        return False
+        # 3. Finalize and Save
+        # Clean up Min arrays (replace Infinity where no flow occurred with 0)
+        min_d[min_d == np.inf] = 0
+        min_v[min_v == np.inf] = 0
+        
+        # Calculate Averages (avoid division by zero)
+        avg_d = np.divide(sum_d, count_mask, out=np.zeros_like(sum_d), where=count_mask > 0)
+        avg_v = np.divide(sum_v, count_mask, out=np.zeros_like(sum_v), where=count_mask > 0)
+
+        # Export map
+        stats = {
+            f"X{x}_Y{y}_max_depth.tif": max_d, f"X{x}_Y{y}_min_depth.tif": min_d, f"X{x}_Y{y}_avg_depth.tif": avg_d,
+            f"X{x}_Y{y}_max_vel.tif": max_v, f"X{x}_Y{y}_min_vel.tif": min_v, f"X{x}_Y{y}_avg_vel.tif": avg_v
+        }
+
+        raster_output_dir = self.simulation_base_path / "summary_stat_rasters"
+        raster_output_dir.mkdir(parents=True, exist_ok=True)
+        for name, data in stats.items():
+            with rasterio.open(raster_output_dir / name, 'w', **m_profile) as dst:
+                dst.write(data, 1)
 
 class AvaFrameBatchWorker:
     def __init__(self, dem_path, config_template, root_dir, parameters):
@@ -377,10 +421,10 @@ class AvaFrameBatchWorker:
                 successful_sim_paths.append(sim_path)
 
             # 3. Merge Results into MaxDepth GeoTIFF
-            out_tiff = self.root_path / "merged_results" / f"max_depth_X{x}_Y{y}.tif"
-            logger.debug(f"   Merging {len(successful_sim_paths)} sim paths into {out_tiff}: {successful_sim_paths}")
+            summary_tiff_path = self.root_path / "results"
+            logger.debug(f"   Merging {len(successful_sim_paths)} sim paths into {summary_tiff_path}: {successful_sim_paths}")
             merge_start = time.perf_counter()
-            merged = self.anriss_manager.create_max_depth_raster(x, y, successful_sim_paths, out_tiff)
+            merged = self.anriss_manager.create_stat_rasters(x, y, successful_sim_paths, summary_tiff_path)
             merge_dur = time.perf_counter() - merge_start
             print(f"✅ Generated MaxDepth GeoTIFF for ({x}, {y}) (merged={merged}, time={merge_dur:.2f}s)")
 
@@ -415,8 +459,9 @@ if __name__ == "__main__":
     logger.info("Worker initialized and ready for 15M points.")
 
     # Simulation parameters
+    #'area': [200, 400, 1500],
     raw_params = {
-        'area': [200, 400, 1500],
+        'area': [200],
         'relTh': [0.75, 1, 3],
         'mu': [0.05, 0.25, 0.375],
         'xsi': [200, 600, 1250],
