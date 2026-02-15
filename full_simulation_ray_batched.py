@@ -15,6 +15,7 @@ import rasterio
 import geopandas as gpd
 import configparser
 import csv
+import logging
 from shapely.geometry import Point
 from ray.util.actor_pool import ActorPool
 
@@ -91,6 +92,22 @@ class AvaFrameAnrissManager:
         self.os_env = os.environ.copy()
         self.os_env["GDAL_PAM_ENABLED"] = "NO"
         self.os_env["GDAL_OUT_PRJ"] = "NO"
+        noisy_loggers = [
+            "avaframe",
+            "avaframe.com1DFA.com1DFATools",
+            "avaframe.com1DFA.checkCfg",
+            "avaframe.in3Utils.cfgUtils",
+            "avaframe.in3Utils.geoTrans",
+            "avaframe.com1DFA.deriveParameterSet",
+            "avaframe.in1Data.getInput",
+            "avaframe.in3Utils.initializeProject",
+            "pyogrio._io"
+        ]
+
+        for logger_name in noisy_loggers:
+            l = logging.getLogger(logger_name)
+            l.setLevel(logging.WARNING) # Only show errors or warnings
+            l.propagate = False         # Prevent them from sending logs up to your s
 
     def setup_dirs(self, root_path):
         input_dir = root_path / "Inputs"
@@ -120,8 +137,7 @@ class AvaFrameAnrissManager:
             if rows.size == 0: return None
             xs, ys = rasterio.transform.xy(src.transform, rows, cols, offset='ul')
             res = src.res[0]
-            return [min(xs) - safety_buffer, min(ys) - safety_buffer, 
-                    max(xs) + res + safety_buffer, max(ys) + safety_buffer]
+            return [min(xs) - safety_buffer, max(xs) + res + safety_buffer, min(ys) - safety_buffer, max(ys) + safety_buffer]
 
     def run_lead_sim(self, x, y):
         start_tc = time.perf_counter()
@@ -150,7 +166,7 @@ class AvaFrameAnrissManager:
             circle = Point(x, y).buffer(radius, quad_segs=16)
             gpd.GeoDataFrame([{'geometry': circle, 'id': 'rel_0'}], crs="EPSG:2056").to_file(input_dir / "REL" / "rel.shp")
             circle_dur = time.perf_counter()-circle_start
-            print(f"   ⏱️ circle Creation took {circle_dur:.2f}s")
+            print(f"   ⏱️ Circle polygon creation took {circle_dur:.2f}s")
 
             cfgMain = avaframe.in3Utils.cfgUtils.getGeneralConfig()
             cfgMain['MAIN']['avalancheDir'] = str(sim_path)
@@ -249,7 +265,7 @@ class AvaFrameAnrissManager:
                             source=current_data,
                             destination=aligned_data,
                             src_transform=src.transform,
-                            src_crs=src.crs,
+                            src_crs=src.crs if src.crs else "EPSG:2056",
                             dst_transform=master_transform,
                             dst_crs=master_profile['crs'],
                             resampling=Resampling.nearest
@@ -273,6 +289,23 @@ class AvaFrameBatchWorker:
         self.worst_case_params_str = "_".join([f"{k}{v}" for k, v in self.worst_case_params.items()])
         self.root_path = Path(root_dir)
         self.anriss_manager = AvaFrameAnrissManager(dem_path, config_template, root_dir, self.worst_case_params)
+        # List of internal AvaFrame loggers that are being chatty
+        noisy_loggers = [
+            "avaframe",
+            "avaframe.com1DFA.com1DFATools",
+            "avaframe.com1DFA.checkCfg",
+            "avaframe.in3Utils.cfgUtils",
+            "avaframe.in3Utils.geoTrans",
+            "avaframe.com1DFA.deriveParameterSet",
+            "avaframe.in1Data.getInput",
+            "avaframe.in3Utils.initializeProject",
+            "pyogrio._io"
+        ]
+
+        for logger_name in noisy_loggers:
+            l = logging.getLogger(logger_name)
+            l.setLevel(logging.WARNING) # Only show errors or warnings
+            l.propagate = False         # Prevent them from sending logs up to your s
 
     def process_batch(self, batch):
         batch_start = time.perf_counter()
@@ -286,7 +319,7 @@ class AvaFrameBatchWorker:
     
     def process_location(self, task_data):
         idx, x, y = task_data
-        log, successful_sim_paths = [], []
+        log_list, successful_sim_paths = [], []
         loc_start = time.perf_counter()
         print(f"📍 Start location idx={idx} ({x},{y})")
         try:          
@@ -301,7 +334,7 @@ class AvaFrameBatchWorker:
             print(f"   Parameter grid: {len(combinations)} combinations. First 5: {combinations[:5]}")
 
             for p in combinations:
-                print(f"   -> Preparing sim for params: {p}")
+                logger.debug(f"   -> Preparing sim for params: {p}")
                 sim_start = time.perf_counter()
                 sim_path = self.simulation_base_path / f"Sim_X{x}_Y{y}_A{p['area']}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
                 
@@ -311,14 +344,14 @@ class AvaFrameBatchWorker:
                         start_time = time.perf_counter()
                         shutil.copy2(DEM_worst_case_simulation_path, p_in / "dem.asc")
                         end_time = time.perf_counter()
-                        print(f"      Copied DEM {DEM_worst_case_simulation_path} -> {p_in / 'dem.asc'} - took: {end_time - start_time:.4f} s")
+                        logger.debug(f"      Copied DEM {DEM_worst_case_simulation_path} -> {p_in / 'dem.asc'} - took: {end_time - start_time:.4f} s")
                         start_time = time.perf_counter()
                         radius = math.sqrt(p['area'] / math.pi)
                         circle = Point(x, y).buffer(radius, quad_segs=16)
                         rel_path = p_in / "REL" / "rel.shp"
                         gpd.GeoDataFrame([{'geometry': circle, 'id': 'rel_0'}], crs="EPSG:2056").to_file(rel_path)
                         end_time = time.perf_counter()
-                        print(f"      Wrote REL polygon to {rel_path} - took: {end_time - start_time:.4f} s")
+                        logger.debug(f"      Wrote REL polygon to {rel_path} - took: {end_time - start_time:.4f} s")
                         
                         cfg = configparser.ConfigParser(); cfg.optionxform = str
                         cfg.read(self.anriss_manager.config_template_path)
@@ -327,25 +360,25 @@ class AvaFrameBatchWorker:
                             cfg.set('GENERAL', k, str(v))
 
                         cfgM = avaframe.in3Utils.cfgUtils.getGeneralConfig(); cfgM['MAIN']['avalancheDir'] = str(sim_path)
-                        print(f"      Starting com1DFA for sim {sim_path}")
+                        logger.debug(f"      Starting com1DFA for sim {sim_path}")
                         com1DFA.com1DFAMain(cfgM, cfgInfo=cfg)
                         sim_dur = time.perf_counter() - sim_start
                         print(f"   ✅ Sim finished for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} in {sim_dur:.2f}s")
-                        log.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], "SUCCESS", ""])
+                        log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], "SUCCESS", ""])
                     except Exception as e:
                         sim_dur = time.perf_counter() - sim_start
                         print(f"   ❌ Sim failed for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} after {sim_dur:.2f}s: {e}")
-                        log.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], "FAIL", str(e)])
+                        log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], "FAIL", str(e)])
                 else:
                     sim_dur = time.perf_counter() - sim_start
                     print(f"   🔁 Skipped worst-case sim (✅ lead simulation already calculated) for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} ({sim_dur:.2f}s)")
-                    log.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], "SUCCESS_LEAD", ""])
+                    log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], "SUCCESS_LEAD", ""])
                 
                 successful_sim_paths.append(sim_path)
 
             # 3. Merge Results into MaxDepth GeoTIFF
             out_tiff = self.root_path / "merged_results" / f"max_depth_X{x}_Y{y}.tif"
-            print(f"   Merging {len(successful_sim_paths)} sim paths into {out_tiff}: {successful_sim_paths}")
+            logger.debug(f"   Merging {len(successful_sim_paths)} sim paths into {out_tiff}: {successful_sim_paths}")
             merge_start = time.perf_counter()
             merged = self.anriss_manager.create_max_depth_raster(x, y, successful_sim_paths, out_tiff)
             merge_dur = time.perf_counter() - merge_start
@@ -355,9 +388,9 @@ class AvaFrameBatchWorker:
             print(f"📍 Location idx={idx} completed in {loc_dur:.2f}s")
 
         except Exception as e:
-            log.append([idx, x, y, 0, 0, 0, 0, 0, "CRITICAL_ERROR", str(e)])
+            log_list.append([idx, x, y, 0, 0, 0, 0, 0, "CRITICAL_ERROR", str(e)])
             raise
-        return log
+        return log_list
     
 if __name__ == "__main__":
     total_start = time.perf_counter()
@@ -371,6 +404,15 @@ if __name__ == "__main__":
     N_RAY_WORKERS = 8
     N_LIMIT_LOCATIONS = 1
     LOCAL_DEBUG_MODE = True
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('[PID %(process)d] %(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.info("Worker initialized and ready for 15M points.")
 
     # Simulation parameters
     raw_params = {
