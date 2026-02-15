@@ -30,6 +30,18 @@ from datetime import datetime
 import avaframe
 from avaframe.com1DFA import com1DFA
 
+# List of internal AvaFrame loggers that are being chatty
+NOISY_LOGGERS = [
+    "avaframe",
+    "avaframe.com1DFA.com1DFATools",
+    "avaframe.com1DFA.checkCfg",
+    "avaframe.in3Utils.cfgUtils",
+    "avaframe.in3Utils.geoTrans",
+    "avaframe.com1DFA.deriveParameterSet",
+    "avaframe.in1Data.getInput",
+    "avaframe.in3Utils.initializeProject",
+    "pyogrio._io"
+]
 os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
 
 def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0005_flag=None):
@@ -68,7 +80,6 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
             break
         yield batch
 
-
 def save_batch_to_csv(rows, logfile_path):
     """Append simulation log rows to `logfile_path` as CSV.
 
@@ -90,7 +101,113 @@ def save_batch_to_csv(rows, logfile_path):
             else:
                 writer.writerow(r)
 
+class AvaFrameOutputManager:
+    def __init__(self, root_dir):
+        self.root_path = Path(root_dir)
+        self.simulation_base_path = self.root_path / "Simulations"
+        self.raster_output_dir = self.simulation_base_path / "summary_stat_rasters"
+
+    def create_stat_rasters(self, x, y, sim_paths, output_dir):
+        """
+        Stacks all rasters to calculate Max, Min, and Avg for both Depth and Velocity,
+        aligned to the cached DEM master grid.
+        """
+        import rasterio
+        import numpy as np
+        from rasterio.warp import reproject, Resampling
+
+        # 1. Anchor to Cached DEM
+        worst_case_str = "_".join([f"{k}{v}" for k, v in self.worst_case_parameters.items()])
+        dem_cache_path = self.root_path / f"DEM_cache_{worst_case_str}" / f"DEM_X{x}_Y{y}.asc"
+        with rasterio.open(dem_cache_path) as master_src:
+            m_trans = master_src.transform
+            m_width, m_height = master_src.width, master_src.height
+            m_profile = master_src.profile.copy()
+        
+        m_profile.update(
+            driver='GTiff',
+            dtype='float32',
+            compress='lzw',
+            tiled=False
+            )
+        m_profile.pop('blockxsize')
+        m_profile.pop('blockysize')
+
+        # Initialize accumulation arrays
+        # Depth Stats
+        max_d = np.zeros((m_height, m_width), dtype='float32')
+        min_d = np.full((m_height, m_width), np.inf, dtype='float32')
+        sum_d = np.zeros((m_height, m_width), dtype='float32')
+        
+        # Velocity Stats (assuming 'pfv' Peak Velocity files)
+        max_v = np.zeros((m_height, m_width), dtype='float32')
+        min_v = np.full((m_height, m_width), np.inf, dtype='float32')
+        sum_v = np.zeros((m_height, m_width), dtype='float32')
+
+        # Count of simulations that hit each pixel (for Avg)
+        count_mask = np.zeros((m_height, m_width), dtype='int32')
+
+        # 2. Process all simulation results
+        for path in sim_paths:
+            # Find Depth (pft) and Velocity (pfv) files
+            pft_file = list(Path(path / "Outputs/com1DFA/peakFiles").glob("*_pft.asc"))
+            pfv_file = list(Path(path / "Outputs/com1DFA/peakFiles").glob("*_pfv.asc"))
+            
+            if not pft_file or not pfv_file: continue
+            
+            for file_path, current_sum, current_max, current_min in [
+                (pft_file[0], sum_d, max_d, min_d), 
+                (pfv_file[0], sum_v, max_v, min_v)
+            ]:
+                with rasterio.open(file_path) as src:
+                    aligned = np.zeros((m_height, m_width), dtype='float32')
+                    reproject(
+                        source=src.read(1), destination=aligned,
+                        src_transform=src.transform, src_crs="EPSG:2056",
+                        dst_transform=m_trans, dst_crs="EPSG:2056",
+                        resampling=Resampling.nearest
+                    )
+                    
+                    # Update Stats
+                    mask = aligned > 0
+                    current_max[mask] = np.maximum(current_max[mask], aligned[mask])
+                    current_min[mask] = np.minimum(current_min[mask], aligned[mask])
+                    current_sum[mask] += aligned[mask]
+                    
+                    # We only update the count mask once per simulation path (using Depth as proxy)
+                    if file_path == pft_file[0]:
+                        count_mask[mask] += 1
+
+        # 3. Finalize and Save
+        # Clean up Min arrays (replace Infinity where no flow occurred with 0)
+        min_d[min_d == np.inf] = 0
+        min_v[min_v == np.inf] = 0
+        
+        # Calculate averages (avoid division by zero)
+        avg_d = np.divide(sum_d, count_mask, out=np.zeros_like(sum_d), where=count_mask > 0)
+        avg_v = np.divide(sum_v, count_mask, out=np.zeros_like(sum_v), where=count_mask > 0)
+
+        # Export raster data
+        stats = {
+            f"X{x}_Y{y}_max_depth.tif": max_d, f"X{x}_Y{y}_min_depth.tif": min_d, f"X{x}_Y{y}_avg_depth.tif": avg_d,
+            f"X{x}_Y{y}_max_vel.tif": max_v, f"X{x}_Y{y}_min_vel.tif": min_v, f"X{x}_Y{y}_avg_vel.tif": avg_v
+        }
+
+        self.raster_output_dir.mkdir(parents=True, exist_ok=True)
+        for name, data in stats.items():
+            with rasterio.open(self.raster_output_dir / name, 'w', **m_profile) as dst:
+                dst.write(data, 1)
+
 class AvaFrameAnrissManager:
+    """
+    Prepares Input for AvaFrame
+    Extracts DEM into ASCII format used by AvaFrame
+    
+
+    :param master_dem_path: 5m DEM for Kanton Bern
+    :param config_template_path: AvaFrame Config template
+    :param root_dir: Root directory for the current simulation    
+    """
     def __init__(self, master_dem_path, config_template_path, root_dir, worst_case_parameters):
         self.master_dem_path = master_dem_path
         self.root_path = Path(root_dir)
@@ -100,19 +217,8 @@ class AvaFrameAnrissManager:
         self.os_env = os.environ.copy()
         self.os_env["GDAL_PAM_ENABLED"] = "NO"
         self.os_env["GDAL_OUT_PRJ"] = "NO"
-        noisy_loggers = [
-            "avaframe",
-            "avaframe.com1DFA.com1DFATools",
-            "avaframe.com1DFA.checkCfg",
-            "avaframe.in3Utils.cfgUtils",
-            "avaframe.in3Utils.geoTrans",
-            "avaframe.com1DFA.deriveParameterSet",
-            "avaframe.in1Data.getInput",
-            "avaframe.in3Utils.initializeProject",
-            "pyogrio._io"
-        ]
 
-        for logger_name in noisy_loggers:
+        for logger_name in NOISY_LOGGERS:
             l = logging.getLogger(logger_name)
             l.setLevel(logging.WARNING) # Only show errors or warnings
             l.propagate = False         # Prevent them from sending logs up to your s
@@ -200,7 +306,6 @@ class AvaFrameAnrissManager:
 
     def get_DEM_for_location(self, x, y):
         """Return (dem_path, extent, buffer) for the worst-case DEM for (x,y).
-
         Uses a cache directory under the manager's `root_path` named by worst-case params.
         """
         worst_case_str = "_".join([f"{k}{v}" for k, v in self.worst_case_parameters.items()])
@@ -227,104 +332,13 @@ class AvaFrameAnrissManager:
             buffer = 0
             return dem_path, extent, buffer
 
+        # ------------------------------------------------------------------------
         # Not cached: run a lead sim to compute tight extent and create the DEM
         dem_path.parent.mkdir(parents=True, exist_ok=True)
         extent, buffer = self.run_lead_sim(x, y)
-        # extract the ascii raster into cache
         self.extract_ascii_raster_from_master_dem(dem_path, extent)
         return dem_path, extent, buffer
-
-    def create_stat_rasters(self, x, y, sim_paths, output_dir):
-        """
-        Stacks all rasters to calculate Max, Min, and Avg for both Depth and Velocity,
-        aligned to the cached DEM master grid.
-        """
-        import rasterio
-        import numpy as np
-        from rasterio.warp import reproject, Resampling
-
-        # 1. Anchor to Cached DEM
-        worst_case_str = "_".join([f"{k}{v}" for k, v in self.worst_case_parameters.items()])
-        dem_cache_path = self.root_path / f"DEM_cache_{worst_case_str}" / f"DEM_X{x}_Y{y}.asc"
-        with rasterio.open(dem_cache_path) as master_src:
-            m_trans = master_src.transform
-            m_width, m_height = master_src.width, master_src.height
-            m_profile = master_src.profile.copy()
-        
-        m_profile.update(
-            driver='GTiff',
-            dtype='float32',
-            compress='lzw',
-            tiled=False
-            )
-        m_profile.pop('blockxsize')
-        m_profile.pop('blockysize')
-
-        # Initialize accumulation arrays
-        # Depth Stats
-        max_d = np.zeros((m_height, m_width), dtype='float32')
-        min_d = np.full((m_height, m_width), np.inf, dtype='float32')
-        sum_d = np.zeros((m_height, m_width), dtype='float32')
-        
-        # Velocity Stats (assuming 'pfv' Peak Velocity files)
-        max_v = np.zeros((m_height, m_width), dtype='float32')
-        min_v = np.full((m_height, m_width), np.inf, dtype='float32')
-        sum_v = np.zeros((m_height, m_width), dtype='float32')
-
-        # Count of simulations that hit each pixel (for Avg)
-        count_mask = np.zeros((m_height, m_width), dtype='int32')
-
-        # 2. Process all simulation results
-        for path in sim_paths:
-            # Find Depth (pft) and Velocity (pfv) files
-            pft_file = list(Path(path / "Outputs/com1DFA/peakFiles").glob("*_pft.asc"))
-            pfv_file = list(Path(path / "Outputs/com1DFA/peakFiles").glob("*_pfv.asc"))
-            
-            if not pft_file or not pfv_file: continue
-            
-            for file_path, current_sum, current_max, current_min in [
-                (pft_file[0], sum_d, max_d, min_d), 
-                (pfv_file[0], sum_v, max_v, min_v)
-            ]:
-                with rasterio.open(file_path) as src:
-                    aligned = np.zeros((m_height, m_width), dtype='float32')
-                    reproject(
-                        source=src.read(1), destination=aligned,
-                        src_transform=src.transform, src_crs="EPSG:2056",
-                        dst_transform=m_trans, dst_crs="EPSG:2056",
-                        resampling=Resampling.nearest
-                    )
-                    
-                    # Update Stats
-                    mask = aligned > 0
-                    current_max[mask] = np.maximum(current_max[mask], aligned[mask])
-                    current_min[mask] = np.minimum(current_min[mask], aligned[mask])
-                    current_sum[mask] += aligned[mask]
-                    
-                    # We only update the count mask once per simulation path (using Depth as proxy)
-                    if file_path == pft_file[0]:
-                        count_mask[mask] += 1
-
-        # 3. Finalize and Save
-        # Clean up Min arrays (replace Infinity where no flow occurred with 0)
-        min_d[min_d == np.inf] = 0
-        min_v[min_v == np.inf] = 0
-        
-        # Calculate Averages (avoid division by zero)
-        avg_d = np.divide(sum_d, count_mask, out=np.zeros_like(sum_d), where=count_mask > 0)
-        avg_v = np.divide(sum_v, count_mask, out=np.zeros_like(sum_v), where=count_mask > 0)
-
-        # Export map
-        stats = {
-            f"X{x}_Y{y}_max_depth.tif": max_d, f"X{x}_Y{y}_min_depth.tif": min_d, f"X{x}_Y{y}_avg_depth.tif": avg_d,
-            f"X{x}_Y{y}_max_vel.tif": max_v, f"X{x}_Y{y}_min_vel.tif": min_v, f"X{x}_Y{y}_avg_vel.tif": avg_v
-        }
-
-        raster_output_dir = self.simulation_base_path / "summary_stat_rasters"
-        raster_output_dir.mkdir(parents=True, exist_ok=True)
-        for name, data in stats.items():
-            with rasterio.open(raster_output_dir / name, 'w', **m_profile) as dst:
-                dst.write(data, 1)
+        # ------------------------------------------------------------------------
 
 class AvaFrameBatchWorker:
     def __init__(self, dem_path, config_template, root_dir, parameters):
@@ -334,36 +348,27 @@ class AvaFrameBatchWorker:
         self.worst_case_params_str = "_".join([f"{k}{v}" for k, v in self.worst_case_params.items()])
         self.root_path = Path(root_dir)
         self.anriss_manager = AvaFrameAnrissManager(dem_path, config_template, root_dir, self.worst_case_params)
-        # List of internal AvaFrame loggers that are being chatty
-        noisy_loggers = [
-            "avaframe",
-            "avaframe.com1DFA.com1DFATools",
-            "avaframe.com1DFA.checkCfg",
-            "avaframe.in3Utils.cfgUtils",
-            "avaframe.in3Utils.geoTrans",
-            "avaframe.com1DFA.deriveParameterSet",
-            "avaframe.in1Data.getInput",
-            "avaframe.in3Utils.initializeProject",
-            "pyogrio._io"
-        ]
 
-        for logger_name in noisy_loggers:
+        for logger_name in NOISY_LOGGERS:
             l = logging.getLogger(logger_name)
             l.setLevel(logging.WARNING) # Only show errors or warnings
             l.propagate = False         # Prevent them from sending logs up to your s
 
     def process_batch(self, batch):
+        """ 
+        Batch = collection of locations (x, y)
+        """
         batch_start = time.perf_counter()
         print(f"📦 Processing batch of {len(batch)} locations")
         results = []
-        for task in batch:
-            results.extend(self.process_location(task))
+        for location in batch:
+            results.extend(self.process_location(location))
         batch_duration = time.perf_counter() - batch_start
         print(f"📦 Batch processed in {batch_duration:.2f}s")
         return results
     
-    def process_location(self, task_data):
-        idx, x, y = task_data
+    def process_location(self, location_data):
+        idx, x, y = location_data
         log_list, successful_sim_paths = [], []
         loc_start = time.perf_counter()
         print(f"📍 Start location idx={idx} ({x},{y})")
@@ -375,44 +380,37 @@ class AvaFrameBatchWorker:
             # 2. Parameter Grid
             keys = self.parameters.keys()
             # TODO extend with modifications / rules defined by AWN / TP Modellierung (instead of simple grid)
-            combinations = [dict(zip(keys, v)) for v in itertools.product(*self.parameters.values())]
-            print(f"   Parameter grid: {len(combinations)} combinations. First 5: {combinations[:5]}")
+            parameter_combinations = [dict(zip(keys, v)) for v in itertools.product(*self.parameters.values())]
+            print(f"   Parameter grid: {len(parameter_combinations)} combinations. First 5: {parameter_combinations[:5]}")
 
-            for p in combinations:
-                logger.debug(f"   -> Preparing sim for params: {p}")
+            for parameter_combination in parameter_combinations:
+                logger.debug(f"   -> Preparing sim for params: {parameter_combination}")
                 sim_start = time.perf_counter()
+                p = parameter_combination
                 sim_path = self.simulation_base_path / f"Sim_X{x}_Y{y}_A{p['area']}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
                 
-                #if p != self.worst_case_params:
-                if True:
+                if parameter_combination != self.worst_case_params:
                     try:
-                        p_in = self.anriss_manager.setup_dirs(sim_path)
-
-                        start_time = time.perf_counter()
-                        shutil.copy2(DEM_worst_case_simulation_path, p_in / "dem.asc")
-                        end_time = time.perf_counter()
-                        logger.debug(f"      Copied DEM {DEM_worst_case_simulation_path} -> {p_in / 'dem.asc'} - took: {end_time - start_time:.4f} s")
-
-                        start_time = time.perf_counter()
+                        input_dir = self.anriss_manager.setup_dirs(sim_path)
+                        shutil.copy2(DEM_worst_case_simulation_path, input_dir / "dem.asc")
                         radius = math.sqrt(p['area'] / math.pi)
                         circle = Point(x, y).buffer(radius, quad_segs=16)
-                        rel_path = p_in / "REL" / "rel.shp"
+                        rel_path = input_dir / "REL" / "rel.shp"
                         gpd.GeoDataFrame([{'geometry': circle, 'id': 'rel_0'}], crs="EPSG:2056").to_file(rel_path)
-                        end_time = time.perf_counter()
-                        logger.debug(f"      Wrote REL polygon to {rel_path} - took: {end_time - start_time:.4f} s")
-                        
                         cfg = configparser.ConfigParser(); cfg.optionxform = str
                         cfg.read(self.anriss_manager.config_template_path)
                         for k, v in [('muvoellmyminshear', p['mu']), ('xsivoellmyminshear', p['xsi']), 
                                      ('tau0voellmyminshear', p['tau0']), ('relTh', p['relTh'])]:
                             cfg.set('GENERAL', k, str(v))
-
                         cfgM = avaframe.in3Utils.cfgUtils.getGeneralConfig(); cfgM['MAIN']['avalancheDir'] = str(sim_path)
                         logger.debug(f"      Starting com1DFA for sim {sim_path}")
+                        # ------------------------------------------------------------------------------------------------
                         com1DFA.com1DFAMain(cfgM, cfgInfo=cfg)
+                        # ------------------------------------------------------------------------------------------------
                         sim_dur = time.perf_counter() - sim_start
                         print(f"   ✅ Sim finished for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} in {sim_dur:.2f}s")
                         log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], "SUCCESS", ""])
+
                     except Exception as e:
                         sim_dur = time.perf_counter() - sim_start
                         print(f"   ❌ Sim failed for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} after {sim_dur:.2f}s: {e}")
@@ -425,12 +423,13 @@ class AvaFrameBatchWorker:
                 successful_sim_paths.append(sim_path)
 
             # 3. Merge Results into MaxDepth GeoTIFF
-            summary_tiff_path = self.root_path / "results"
-            logger.debug(f"   Merging {len(successful_sim_paths)} sim paths into {summary_tiff_path}: {successful_sim_paths}")
-            merge_start = time.perf_counter()
-            merged = self.anriss_manager.create_stat_rasters(x, y, successful_sim_paths, summary_tiff_path)
-            merge_dur = time.perf_counter() - merge_start
-            print(f"✅ Generated MaxDepth GeoTIFF for ({x}, {y}) (merged={merged}, time={merge_dur:.2f}s)")
+            # TODO replace with output from parquet
+            #summary_tiff_path = self.root_path / "results"
+            #logger.debug(f"   Merging {len(successful_sim_paths)} sim paths into {summary_tiff_path}: {successful_sim_paths}")
+            #merge_start = time.perf_counter()
+            #merged = self.anriss_manager.create_stat_rasters(x, y, successful_sim_paths, summary_tiff_path)
+            #merge_dur = time.perf_counter() - merge_start
+            #print(f"✅ Generated MaxDepth GeoTIFF for ({x}, {y}) (merged={merged}, time={merge_dur:.2f}s)")
 
             loc_dur = time.perf_counter() - loc_start
             print(f"📍 Location idx={idx} completed in {loc_dur:.2f}s")
@@ -441,6 +440,10 @@ class AvaFrameBatchWorker:
         return log_list
     
 if __name__ == "__main__":
+
+    # ===========================================================================================================
+    # 0) CONFIG
+    # ===========================================================================================================
     total_start = time.perf_counter()
 
     BE_DEM_5M = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned_5km_buffer_COG_cropped.tif"
@@ -450,8 +453,9 @@ if __name__ == "__main__":
     LOG_FILE = Path(SIM_ROOT) / f"log_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     RAY_MODE = "local_debug"
     N_RAY_WORKERS = 8
+    MAX_IN_FLIGHT = N_RAY_WORKERS * 2  # queue one task for every worker
     N_LIMIT_LOCATIONS = 1
-    LOCAL_SINGLE_THREAD_DEBUG_MODE = True
+    LOCAL_SINGLE_THREAD_DEBUG_MODE = False
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -460,10 +464,12 @@ if __name__ == "__main__":
     formatter = logging.Formatter('[PID %(process)d] %(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    logger.info("Worker initialized and ready for 15M points.")
+
+    # ===========================================================================================================
+    # 1) PREPARE SIMULATION
+    # ===========================================================================================================
 
     # Simulation parameters
-    #'area': [200, 400, 1500],
     raw_params = {
         'area': [200, 400, 1500],
         'relTh': [0.75, 1, 3],
@@ -480,20 +486,9 @@ if __name__ == "__main__":
         'tau0': sorted(raw_params['tau0']),
     }
 
-    # Prepare Simulation by setting up the DuckDB batch generator (batch = locations (X/Y))
-    # TODO read from S3
-    batch_generator = get_location_batches(LOCATIONS, batch_size=10 , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=True)
-    # next(batch_generator) # get next batch from generator
-
-    MAX_IN_FLIGHT = N_RAY_WORKERS * 2  # queue one task for every worker
-    in_flight = 0
-
-    def create_worker(*args, **kwargs):
-        if LOCAL_SINGLE_THREAD_DEBUG_MODE:
-            return WorkerClass(*args, **kwargs)
-        else:
-            return WorkerClass.remote(*args, **kwargs)
-
+    # ===========================================================================================================
+    # 2) LOCAL SINGLE-THREADED DEBUG
+    # ==========================================================================================================
     if LOCAL_SINGLE_THREAD_DEBUG_MODE:
         print("RUNNING IN DEBUG MODE WITHOUT RAY")
         print("using AvaFrameBatchWorker directly, no remote, no ncpu")
@@ -501,7 +496,7 @@ if __name__ == "__main__":
         # Manually call the method
         test_location = [(0, 2608198, 1145230)]
         test_location = [(0, 2608200, 1145235)]
-        debug_worker = create_worker(BE_DEM_5M, CONFIG_TEMPLATE, SIM_ROOT, sorted_params)
+        debug_worker = WorkerClass(BE_DEM_5M, CONFIG_TEMPLATE, SIM_ROOT, sorted_params)
         results = debug_worker.process_batch(test_location)
         try:
             written = save_batch_to_csv(results, LOG_FILE)
@@ -514,7 +509,9 @@ if __name__ == "__main__":
             print(f"⚠️ Failed to write debug log: {e}")
         sys.exit(0)
 
-    # Initialize Ray Cluster
+    # ===========================================================================================================
+    # 3) INITIALIZE RAY CLUSTER
+    # ==========================================================================================================
     print("Initializing Ray Cluster...")
     if not ray.is_initialized():
         if RAY_MODE == "local_debug":
@@ -522,26 +519,36 @@ if __name__ == "__main__":
         elif RAY_MODE == "local_cluster":
             ray.init()
 
+    def create_worker(*args, **kwargs):
+        # wrapping to enable both local debug without decorator and remote with decorator
+        return WorkerClass.remote(*args, **kwargs)
+
     # N_RAY_WORKERS = int(ray.available_resources().get("CPU", 4))
     print(f"Setting up {N_RAY_WORKERS} Ray Workers ...")
     WorkerClass = ray.remote(num_cpus=1)(AvaFrameBatchWorker)
     workers = [create_worker(BE_DEM_5M, CONFIG_TEMPLATE, SIM_ROOT, sorted_params) for i in range(N_RAY_WORKERS)]
     pool = ActorPool(workers)
 
-    # Run simulations
-    with tqdm(desc="Locations", unit="Center Coordinates") as pbar:
+    # ===========================================================================================================
+    # 4) RUN SIMULATIONS
+    # ==========================================================================================================
+
+    # Prepare INPUT for simulation by setting up the DuckDB batch generator (batch = locations (X/Y))
+    # TODO read from S3
+    batch_generator = get_location_batches(LOCATIONS, batch_size=10 , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=True)
+
+    in_flight = 0
+    with tqdm(desc="Simulation", unit="Locations") as pbar:
         while True:
             # A. Feed the Pool until we hit backpressure limit
             while in_flight < MAX_IN_FLIGHT:
-                # If the generator has been exhausted it will be set to None
-                if batch_generator is None:
+                if batch_generator is None:  # if the generator has been exhausted it will be set to None
                     break
                 try:
                     batch = next(batch_generator)  # take the next entry from the batch generator
                     pool.submit(lambda a, v: a.process_batch.remote(v), batch)
                     in_flight += 1
-                except StopIteration:
-                    # Exhausted the input list (generator "finished")
+                except StopIteration:  # Exhausted the input list (generator "finished")
                     batch_generator = None # remove the generator
                     break
             
@@ -555,8 +562,7 @@ if __name__ == "__main__":
                 batch_results = pool.get_next()
                 in_flight -= 1
                 
-                # D. Incremental Save (Essential!)
-                # Append results to CSV log file
+                # D. Incremental save: append results to CSV log file
                 try:
                     written = save_batch_to_csv(batch_results, LOG_FILE)
                     print(f"📥 Appended {written} rows to log {LOG_FILE}")
