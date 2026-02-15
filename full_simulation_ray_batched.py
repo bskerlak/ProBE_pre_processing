@@ -14,6 +14,7 @@ import numpy as np
 import rasterio
 import geopandas as gpd
 import configparser
+import csv
 from shapely.geometry import Point
 from ray.util.actor_pool import ActorPool
 
@@ -58,30 +59,52 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
             break
         yield batch
 
+
+def save_batch_to_csv(rows, logfile_path):
+    """Append simulation log rows to `logfile_path` as CSV.
+
+    Each row should be: [idx, x, y, area, relTh, mu, xsi, tau0, status, message]
+    """
+    logfile_path = Path(logfile_path)
+    header = ['idx', 'x', 'y', 'area', 'relTh', 'mu', 'xsi', 'tau0', 'status', 'message']
+    write_header = not logfile_path.exists()
+    logfile_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(logfile_path, 'a', newline='') as fh:
+        writer = csv.writer(fh)
+        if write_header:
+            writer.writerow(header)
+        for r in rows:
+            # If row is nested (e.g., list of lists), flatten accordingly
+            if isinstance(r, (list, tuple)) and len(r) and isinstance(r[0], (list, tuple)):
+                for sub in r:
+                    writer.writerow(sub)
+            else:
+                writer.writerow(r)
+
 class AvaFrameAnrissManager:
-    def __init__(self, master_dem_path, config_template_path, root_path, worst_case_parameters):
+    def __init__(self, master_dem_path, config_template_path, root_dir, worst_case_parameters):
         self.master_dem_path = master_dem_path
-        self.simulation_base_path = Path(root_path) / "Simulations"
+        self.root_path = Path(root_dir)
+        self.simulation_base_path = self.root_path / "Simulations"
         self.config_template_path = config_template_path
         self.worst_case_parameters = worst_case_parameters
         self.os_env = os.environ.copy()
         self.os_env["GDAL_PAM_ENABLED"] = "NO"
         self.os_env["GDAL_OUT_PRJ"] = "NO"
 
-    def setup_dirs(self, root_dir):
-        input_dir = root_dir / "Inputs"
+    def setup_dirs(self, root_path):
+        input_dir = root_path / "Inputs"
         subdirs = ["CONFIG", "ENT", "LINES", "POINTS", "REL", "RELTH", "RES", "SECREL"]
         for s in subdirs:
             os.makedirs(input_dir / s, exist_ok=True)
-        os.makedirs(root_dir / "Outputs", exist_ok=True)
+        os.makedirs(root_path / "Outputs", exist_ok=True)
         return input_dir
 
-    def extract_dem(self, out_path, extent):
-        sx_min, sy_min, sx_max, sy_max = [(v // 5) * 5 for v in extent]
+    def extract_ascii_raster_from_master_dem(self, out_path, extent):
+        sx_min, sx_max, sy_min, sy_max = [(v // 5) * 5 for v in extent]
         cmd = [
             "gdal_translate", "-of", "AAIGrid",
-            "-projwin", str(sx_min), str(sy_max),
-            str(sx_max), str(sy_min),
+            "-projwin", str(sx_min), str(sy_max), str(sx_max), str(sy_min),
             "-co", "FORCE_CELLSIZE=YES",
             "-co", "DECIMAL_PRECISION=2",
             self.master_dem_path, str(out_path)
@@ -114,11 +137,20 @@ class AvaFrameAnrissManager:
         buffer_delta = 500
 
         while not success and buffer <= 10000:
-            extent = [x-buffer, y-buffer, x+buffer, y+buffer]
-            self.extract_dem(input_dir / "dem.asc", extent)
+            xmin, xmax = x - buffer, x + buffer
+            ymin, ymax = y - buffer, y + buffer
+            extent = [xmin, xmax, ymin, ymax]
+            extract_start = time.perf_counter()
+            self.extract_ascii_raster_from_master_dem(input_dir / "dem.asc", extent)
+            extract_dur = time.perf_counter() - extract_start
+            print(f"   ⏱️ DEM extraction took {extract_dur:.2f}s")
+            
+            circle_start = time.perf_counter()
             radius = math.sqrt(p['area'] / math.pi)
             circle = Point(x, y).buffer(radius, quad_segs=16)
             gpd.GeoDataFrame([{'geometry': circle, 'id': 'rel_0'}], crs="EPSG:2056").to_file(input_dir / "REL" / "rel.shp")
+            circle_dur = time.perf_counter()-circle_start
+            print(f"   ⏱️ circle Creation took {circle_dur:.2f}s")
 
             cfgMain = avaframe.in3Utils.cfgUtils.getGeneralConfig()
             cfgMain['MAIN']['avalancheDir'] = str(sim_path)
@@ -142,6 +174,42 @@ class AvaFrameAnrissManager:
         lead_duration = time.perf_counter() - start_tc
         print(f"✂️✅ Tight Extent calculated: {tight_extent} - needed buffer: {buffer} (lead sim: {lead_duration:.2f}s)")
         return [int(np.round(v // 5 * 5)) for v in tight_extent], buffer
+
+    def get_DEM_for_location(self, x, y):
+        """Return (dem_path, extent, buffer) for the worst-case DEM for (x,y).
+
+        Uses a cache directory under the manager's `root_path` named by worst-case params.
+        """
+        worst_case_str = "_".join([f"{k}{v}" for k, v in self.worst_case_parameters.items()])
+        dem_path = self.root_path / f"DEM_cache_{worst_case_str}" / f"DEM_X{x}_Y{y}.asc"
+
+        if dem_path.exists():
+            print(f"🔄 Using existing cache for ({x}, {y}): {dem_path}")
+            header = {}
+            with open(dem_path, 'r') as f:
+                for _ in range(6):
+                    line = f.readline().split()
+                    if not line:
+                        break
+                    header[line[0].lower()] = float(line[1])
+
+            x_min = header.get('xllcorner')
+            y_min = header.get('yllcorner')
+            ncols = int(header.get('ncols'))
+            nrows = int(header.get('nrows'))
+            cellsize = header.get('cellsize')
+            x_max = x_min + (ncols * cellsize)
+            y_max = y_min + (nrows * cellsize)
+            extent = [x_min, x_max, y_min, y_max]
+            buffer = 0
+            return dem_path, extent, buffer
+
+        # Not cached: run a lead sim to compute tight extent and create the DEM
+        dem_path.parent.mkdir(parents=True, exist_ok=True)
+        extent, buffer = self.run_lead_sim(x, y)
+        # extract the ascii raster into cache
+        self.extract_ascii_raster_from_master_dem(dem_path, extent)
+        return dem_path, extent, buffer
 
     def create_max_depth_raster(self, x, y, sim_paths, output_path):
         """Stacks all peak flow thickness rasters, aligning them to a common master grid."""
@@ -198,13 +266,13 @@ class AvaFrameAnrissManager:
         return False
 
 class AvaFrameBatchWorker:
-    def __init__(self, dem_path, config_template, root_path, parameters):
+    def __init__(self, dem_path, config_template, root_dir, parameters):
         self.parameters = parameters
-        self.simulation_base_path = Path(root_path) / "Simulations"
+        self.simulation_base_path = Path(root_dir) / "Simulations"
         self.worst_case_params = {k: v[0] for k, v in parameters.items()}
         self.worst_case_params_str = "_".join([f"{k}{v}" for k, v in self.worst_case_params.items()])
-        self.root_dir = Path(root_path)
-        self.manager = AvaFrameAnrissManager(dem_path, config_template, root_path, self.worst_case_params)
+        self.root_path = Path(root_dir)
+        self.anriss_manager = AvaFrameAnrissManager(dem_path, config_template, root_dir, self.worst_case_params)
 
     def process_batch(self, batch):
         batch_start = time.perf_counter()
@@ -215,45 +283,51 @@ class AvaFrameBatchWorker:
         batch_duration = time.perf_counter() - batch_start
         print(f"📦 Batch processed in {batch_duration:.2f}s")
         return results
-
+    
     def process_location(self, task_data):
         idx, x, y = task_data
         log, successful_sim_paths = [], []
         loc_start = time.perf_counter()
         print(f"📍 Start location idx={idx} ({x},{y})")
-        try:
-            # 1. Lead Simulation
-            tight_extent, buffer = self.manager.run_lead_sim(x, y)
-            
-            # 2. Extract & Cache Production DEM
-            cache_path = self.root_dir / f"DEM_cache_{self.worst_case_params_str}" / f"DEM_X{x}_Y{y}.asc"
-            cache_path.parent.mkdir(exist_ok=True, parents=True)
-            self.manager.extract_dem(cache_path, tight_extent)
+        try:          
+            # 1. Get DEM for this location
+            DEM_worst_case_simulation_path, worst_case_simulation_extent, buffer = self.anriss_manager.get_DEM_for_location(x, y)
+            self.anriss_manager.extract_ascii_raster_from_master_dem(DEM_worst_case_simulation_path, worst_case_simulation_extent)
 
-            # 3. Parameter Grid
+            # 2. Parameter Grid
             keys = self.parameters.keys()
             # TODO extend with modifications / rules defined by AWN / TP Modellierung (instead of simple grid)
             combinations = [dict(zip(keys, v)) for v in itertools.product(*self.parameters.values())]
-            
+            print(f"   Parameter grid: {len(combinations)} combinations. First 5: {combinations[:5]}")
+
             for p in combinations:
+                print(f"   -> Preparing sim for params: {p}")
                 sim_start = time.perf_counter()
                 sim_path = self.simulation_base_path / f"Sim_X{x}_Y{y}_A{p['area']}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
                 
                 if p != self.worst_case_params:
                     try:
-                        p_in = self.manager.setup_dirs(sim_path)
-                        shutil.copy2(cache_path, p_in / "dem.asc")
+                        p_in = self.anriss_manager.setup_dirs(sim_path)
+                        start_time = time.perf_counter()
+                        shutil.copy2(DEM_worst_case_simulation_path, p_in / "dem.asc")
+                        end_time = time.perf_counter()
+                        print(f"      Copied DEM {DEM_worst_case_simulation_path} -> {p_in / 'dem.asc'} - took: {end_time - start_time:.4f} s")
+                        start_time = time.perf_counter()
                         radius = math.sqrt(p['area'] / math.pi)
                         circle = Point(x, y).buffer(radius, quad_segs=16)
-                        gpd.GeoDataFrame([{'geometry': circle, 'id': 'rel_0'}], crs="EPSG:2056").to_file(p_in / "REL" / "rel.shp")
+                        rel_path = p_in / "REL" / "rel.shp"
+                        gpd.GeoDataFrame([{'geometry': circle, 'id': 'rel_0'}], crs="EPSG:2056").to_file(rel_path)
+                        end_time = time.perf_counter()
+                        print(f"      Wrote REL polygon to {rel_path} - took: {end_time - start_time:.4f} s")
                         
                         cfg = configparser.ConfigParser(); cfg.optionxform = str
-                        cfg.read(self.manager.config_template_path)
+                        cfg.read(self.anriss_manager.config_template_path)
                         for k, v in [('muvoellmyminshear', p['mu']), ('xsivoellmyminshear', p['xsi']), 
                                      ('tau0voellmyminshear', p['tau0']), ('relTh', p['relTh'])]:
                             cfg.set('GENERAL', k, str(v))
 
                         cfgM = avaframe.in3Utils.cfgUtils.getGeneralConfig(); cfgM['MAIN']['avalancheDir'] = str(sim_path)
+                        print(f"      Starting com1DFA for sim {sim_path}")
                         com1DFA.com1DFAMain(cfgM, cfgInfo=cfg)
                         sim_dur = time.perf_counter() - sim_start
                         print(f"   ✅ Sim finished for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} in {sim_dur:.2f}s")
@@ -269,10 +343,11 @@ class AvaFrameBatchWorker:
                 
                 successful_sim_paths.append(sim_path)
 
-            # 4. Merge Results into MaxDepth GeoTIFF
-            out_tiff = self.root_dir / "merged_results" / f"max_depth_X{x}_Y{y}.tif"
+            # 3. Merge Results into MaxDepth GeoTIFF
+            out_tiff = self.root_path / "merged_results" / f"max_depth_X{x}_Y{y}.tif"
+            print(f"   Merging {len(successful_sim_paths)} sim paths into {out_tiff}: {successful_sim_paths}")
             merge_start = time.perf_counter()
-            merged = self.manager.create_max_depth_raster(x, y, successful_sim_paths, out_tiff)
+            merged = self.anriss_manager.create_max_depth_raster(x, y, successful_sim_paths, out_tiff)
             merge_dur = time.perf_counter() - merge_start
             print(f"✅ Generated MaxDepth GeoTIFF for ({x}, {y}) (merged={merged}, time={merge_dur:.2f}s)")
 
@@ -281,6 +356,7 @@ class AvaFrameBatchWorker:
 
         except Exception as e:
             log.append([idx, x, y, 0, 0, 0, 0, 0, "CRITICAL_ERROR", str(e)])
+            raise
         return log
     
 if __name__ == "__main__":
@@ -327,6 +403,15 @@ if __name__ == "__main__":
         # Manually call the method
         test_location = [(0, 2608198, 1145230)]
         results = debug_worker.process_batch(test_location)
+        try:
+            written = save_batch_to_csv(results, LOG_FILE)
+            print(f"✅ Wrote debug log to {LOG_FILE} ({written} rows)")
+            # show sample of log rows
+            print("Sample log rows:")
+            for r in results[:5]:
+                print("  ", r)
+        except Exception as e:
+            print(f"⚠️ Failed to write debug log: {e}")
         sys.exit(0)
 
     # Initialize Ray Cluster
@@ -370,10 +455,13 @@ if __name__ == "__main__":
                 in_flight -= 1
                 
                 # D. Incremental Save (Essential!)
-                # Write results to a unique parquet file to avoid file locking
-                # TODO
-                #save_batch_to_parquet(batch_results)
-                
+                # Append results to CSV log file
+                try:
+                    written = save_batch_to_csv(batch_results, LOG_FILE)
+                    print(f"📥 Appended {written} rows to log {LOG_FILE}")
+                except Exception as e:
+                    print(f"⚠️ Failed to write batch to log: {e}")
+
                 pbar.update(len(batch_results))
                 
             except Exception as e:
