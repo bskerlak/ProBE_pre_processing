@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 import subprocess
 import math
@@ -139,7 +140,7 @@ class AvaFrameAnrissManager:
         matches = list((sim_path / "Outputs" / "com1DFA" / "peakFiles").glob("*_pft.asc"))
         tight_extent = self.get_flow_bounds(matches[0])
         lead_duration = time.perf_counter() - start_tc
-        print(f"✂️ Tight Extent calculated: {tight_extent} - needed buffer: {buffer} (lead sim: {lead_duration:.2f}s)")
+        print(f"✂️✅ Tight Extent calculated: {tight_extent} - needed buffer: {buffer} (lead sim: {lead_duration:.2f}s)")
         return [int(np.round(v // 5 * 5)) for v in tight_extent], buffer
 
     def create_max_depth_raster(self, x, y, sim_paths, output_path):
@@ -196,14 +197,14 @@ class AvaFrameAnrissManager:
             return True
         return False
 
-@ray.remote(num_cpus=1)
 class AvaFrameBatchWorker:
-    def __init__(self, dem_path, config_template, root_dir, parameters):
+    def __init__(self, dem_path, config_template, root_path, parameters):
         self.parameters = parameters
+        self.simulation_base_path = Path(root_path) / "Simulations"
         self.worst_case_params = {k: v[0] for k, v in parameters.items()}
         self.worst_case_params_str = "_".join([f"{k}{v}" for k, v in self.worst_case_params.items()])
-        self.root_dir = Path(root_dir)
-        self.manager = AvaFrameAnrissManager(dem_path, config_template, root_dir, self.worst_case_params)
+        self.root_dir = Path(root_path)
+        self.manager = AvaFrameAnrissManager(dem_path, config_template, root_path, self.worst_case_params)
 
     def process_batch(self, batch):
         batch_start = time.perf_counter()
@@ -236,7 +237,7 @@ class AvaFrameBatchWorker:
             
             for p in combinations:
                 sim_start = time.perf_counter()
-                sim_path = self.root_dir / "results" / f"Sim_X{x}_Y{y}_A{p['area']}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
+                sim_path = self.simulation_base_path / f"Sim_X{x}_Y{y}_A{p['area']}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
                 
                 if p != self.worst_case_params:
                     try:
@@ -263,7 +264,7 @@ class AvaFrameBatchWorker:
                         log.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], "FAIL", str(e)])
                 else:
                     sim_dur = time.perf_counter() - sim_start
-                    print(f"   🔁 Skipped worst-case sim (lead) for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} ({sim_dur:.2f}s)")
+                    print(f"   🔁 Skipped worst-case sim (✅ lead simulation already calculated) for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} ({sim_dur:.2f}s)")
                     log.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], "SUCCESS_LEAD", ""])
                 
                 successful_sim_paths.append(sim_path)
@@ -281,7 +282,7 @@ class AvaFrameBatchWorker:
         except Exception as e:
             log.append([idx, x, y, 0, 0, 0, 0, 0, "CRITICAL_ERROR", str(e)])
         return log
-
+    
 if __name__ == "__main__":
     total_start = time.perf_counter()
 
@@ -293,6 +294,7 @@ if __name__ == "__main__":
     RAY_MODE = "local_debug"
     N_RAY_WORKERS = 8
     N_LIMIT_LOCATIONS = 1
+    LOCAL_DEBUG_MODE = True
 
     # Simulation parameters
     raw_params = {
@@ -318,6 +320,14 @@ if __name__ == "__main__":
 
     MAX_IN_FLIGHT = N_RAY_WORKERS * 2  # queue one task for every worker
     in_flight = 0
+
+    if LOCAL_DEBUG_MODE:
+        print("RUNNING IN DEBUG MODE WITHOUT RAY")
+        debug_worker = AvaFrameBatchWorker(BE_DEM_5M, CONFIG_TEMPLATE, SIM_ROOT, sorted_params)
+        # Manually call the method
+        test_location = [(0, 2608198, 1145230)]
+        results = debug_worker.process_batch(test_location)
+        sys.exit(0)
 
     # Initialize Ray Cluster
     print("Initializing Ray Cluster...")

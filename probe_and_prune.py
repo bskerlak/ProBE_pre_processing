@@ -10,14 +10,19 @@ import configparser
 import shutil
 import csv
 import random
+import ray
+import tqdm
+import itertools
 
 from pathlib import Path
 from shapely.geometry import Point
 from shapely.geometry import box
+from shapely.prepared import prep
 
 import avaframe
 from avaframe.com1DFA import com1DFA
 import time
+from datetime import datetime
 
 class AvaFrameAnrissManager:
     def __init__(self, master_dem_path, config_template_path, base_path, worst_case_parameters):
@@ -238,127 +243,110 @@ class AvaFrameAnrissManager:
         # also return the buffer that was required to contain the simulation
         return tight_extent_int, buffer
 
+@ray.remote
+def process_batch(batch, master_dem, config_template, root_dir, parameters):
+    # Identify worst case (first elements as per instruction)
+    worst_case_params = {k: v[0] for k, v in parameters.items()}
+    
+    manager = AvaFrameAnrissManager(master_dem, config_template, root_dir, worst_case_params)
+    
+    # Generate all combinations
+    keys = parameters.keys()
+    values = parameters.values()
+    param_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    
+    results_info = []
+    
+    for (x, y) in batch:
+        try:
+            print(f"🔄 Processing location {x}, {y}")
+            # 1. Run Probe (Worst Case) -> Get Tight Extent
+            tight_extent, buffer_used = manager.run_probe_and_prepare(x, y)
+            
+            # 2. Extract Tight DEM (Cache)
+            cache_dir = Path(root_dir) / "cache_dems"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tight_dem_path = cache_dir / f"tight_dem_{x}_{y}.asc"
+            manager.extract_dem(tight_dem_path, tight_extent)
+            
+            # 3. Run All Simulations on Tight DEM
+            # Use a temporary production directory for this coordinate
+            prod_dir = Path(root_dir) / f"Production_X{x}_Y{y}"
+            input_dir = manager.setup_dirs(prod_dir)
+            
+            # Copy Tight DEM to Inputs
+            shutil.copy(tight_dem_path, input_dir / "dem.asc")
+            
+            for params in param_combinations:
+                # Prepare Release (Clear existing first)
+                for f in (input_dir / "REL").glob("*"):
+                    f.unlink()
+                manager.create_release(input_dir / "REL", x, y, params['area'])
+                
+                # Prepare Config
+                run_config = configparser.ConfigParser()
+                run_config.optionxform = str
+                run_config.read(config_template)
+                run_config.set('GENERAL', 'muvoellmyminshear', str(params['mu']))
+                run_config.set('GENERAL', 'xsivoellmyminshear', str(params['xsi']))
+                run_config.set('GENERAL', 'tau0voellmyminshear', str(params['tau0']))
+                run_config.set('GENERAL', 'relTh', str(params['relTh']))
+                
+                # Run AvaFrame
+                cfgMain = avaframe.in3Utils.cfgUtils.getGeneralConfig()
+                cfgMain['MAIN']['avalancheDir'] = str(prod_dir)
+                cfgMain['MAIN']['nCPU'] = '1'
+                
+                com1DFA.com1DFAMain(cfgMain, cfgInfo=run_config)
+            
+            # Cleanup
+            shutil.rmtree(prod_dir)
+            if tight_dem_path.exists(): tight_dem_path.unlink()
+            
+        except Exception as e:
+            print(f"❌ Failed location {x}, {y}: {e}")
+            
+    return results_info
+
 if __name__ == "__main__":
     # Settings
     BERN_DEM_5M = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned_5km_buffer_COG_cropped.tif"
+    SWISSBOUNDARIES_GDB = "/home/bojan/probe_pre_processing/data/swissboundaries/swissBOUNDARIES3D_1_5_LV95_LN02.gdb"
     CONFIG_TEMPLATE = "/home/bojan/probe_pre_processing/cfgCom1DFA_template.ini"
     SIMULATION_DATA_ROOT_DIR = "/home/bojan/probe_data/bern"
-    PERFORMANCE_LOG = Path(SIMULATION_DATA_ROOT_DIR) / "performance_log.csv"
-    NUM_SAMPLES = 10
+    timestamp = datetime.now().strftime("%Y%m%d")
+    PRE_PROCESSING_LOG = Path(SIMULATION_DATA_ROOT_DIR) / f"pre_processing_{timestamp}_log.csv"
 
     # Parameters
-    # default Pro-Mo parameter (from 2024; 3 Anrissflächen und 54 = 3*3*2*3 Parameter)
+    # Sorted so that index 0 is the "worst case" (Probe)
     parameters = {
-        'area': [200, 400, 1500],
-        'relTh': [0.75, 1, 3],
-        'mu': [0.05, 0.25, 0.375],
-        'xsi': [200, 600, 1250],
-        'tau0': [500, 1500],
+        'area': sorted([200, 400, 1500], reverse=True), # Max area
+        'relTh': sorted([0.75, 1, 3], reverse=True),    # Max thickness
+        'mu': sorted([0.05, 0.25, 0.375]),              # Min friction
+        'xsi': sorted([200, 600, 1250], reverse=True),  # Max turbulence (min friction)
+        'tau0': sorted([500, 1500]),                    # Min cohesion
     }
 
-    # get worst case parameter combination
-    # grösste Masse = grösstes relTH, grösste Fläche / area
-    # kleinste Reibung = kleinstes mü, grösstes xsi, kleinstes tau0  
-    worst_case_parameters = {
-        'area': max(parameters['area']),
-        'relTh': max(parameters['relTh']),
-        'mu': min(parameters['mu']),
-        'xsi': max(parameters['xsi']),
-        'tau0': min(parameters['tau0']),
-    }
-   
-    # AvaFrame Anriss Manager: Braucht Kanton BE DEM, Config Template und Output Directory
-    manager = AvaFrameAnrissManager(BERN_DEM_5M, CONFIG_TEMPLATE, SIMULATION_DATA_ROOT_DIR, worst_case_parameters)
+    # Initialize Ray
+    ray.init()
     
-    # 1. Generate Random Locations
-    print(f"🎲 Generating {NUM_SAMPLES} random locations in Kanton Bern...")
-    locations = []
-    with rasterio.open(BERN_DEM_5M) as src:
-        bounds = src.bounds
-        nodata = src.nodata
-        while len(locations) < NUM_SAMPLES:
-            rx = random.uniform(bounds.left, bounds.right)
-            ry = random.uniform(bounds.bottom, bounds.top)
-            # Check if valid (not NoData)
-            try:
-                val = next(src.sample([(rx, ry)]))[0]
-                if val != nodata and val > -9999:
-                    locations.append((int(rx), int(ry)))
-            except Exception:
-                continue
+    # 1. Read Locations from GPKG
+    locations_gpkg = Path(SIMULATION_DATA_ROOT_DIR) / "locations_random_1000.gpkg"
+    print(f"📂 Reading locations from {locations_gpkg}...")
+    gdf = gpd.read_file(locations_gpkg)
+    locations = [(int(p.x), int(p.y)) for p in gdf.geometry]
+    print(f"✅ Loaded {len(locations)} locations.")
 
-    # Initialize CSV
-    with open(PERFORMANCE_LOG, 'w', newline='') as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(['idx', 'x', 'y', 'probe_time_s', 'extract_time_s', 'total_time_s', 'extent_area_m2', 'buffer_m', 'status', 'error'])
+    # 2. Batching
+    BATCH_SIZE = 10
+    batches = [locations[i:i + BATCH_SIZE] for i in range(0, len(locations), BATCH_SIZE)]
+    print(f"📦 Created {len(batches)} batches of size {BATCH_SIZE}.")
 
-    print(f"🚀 Starting batch processing of {len(locations)} locations.")
-
-    for idx, (rel_x, rel_y) in enumerate(locations):
-        print(f"\n--- Run {idx+1}/{NUM_SAMPLES} @ ({rel_x}, {rel_y}) ---")
-        
-        t_start = time.perf_counter()
-        status = "SUCCESS"
-        error_msg = ""
-        probe_time = 0
-        extract_time = 0
-        extent_area = 0
-        buffer_used = ""
-        
-        try:
-            # 2. Define paths
-            master_dem_name = f"production_dem_X{rel_x}_Y{rel_y}.asc"
-            master_dem_path = Path(SIMULATION_DATA_ROOT_DIR) / "cache_dems" / master_dem_name
-            master_dem_path.parent.mkdir(exist_ok=True)
-
-            # 3. Run Probe
-            t0 = time.perf_counter()
-            production_extent, buffer_used = manager.run_probe_and_prepare(rel_x, rel_y)
-            t1 = time.perf_counter()
-            probe_time = t1 - t0
-            
-            # Calculate Area
-            width = production_extent[2] - production_extent[0]
-            height = production_extent[3] - production_extent[1]
-            extent_area = width * height
-
-            # 4. Extract DEM
-            t2 = time.perf_counter()
-            manager.extract_dem(master_dem_path, production_extent)
-            t3 = time.perf_counter()
-            extract_time = t3 - t2
-            
-            # 5. Create Production Folders (and cleanup immediately for perf test)
-            for area in parameters["area"]:
-                mod_dir_name = f"AnrissX{rel_x}Y{rel_y}Area{area}"
-                mod_dir_path = Path(SIMULATION_DATA_ROOT_DIR) / mod_dir_name
-                p_input = manager.setup_dirs(mod_dir_path)
-                shutil.copy2(master_dem_path, p_input)
-                manager.create_release(p_input / "REL", rel_x, rel_y, area)
-                # Cleanup production folder immediately to save space
-                shutil.rmtree(mod_dir_path)
-            
-            # Cleanup Probe
-            probe_path = Path(SIMULATION_DATA_ROOT_DIR) / f"ProbeAnrissX{int(rel_x)}Y{int(rel_y)}A{int(worst_case_parameters['area'])}"
-            if probe_path.exists():
-                shutil.rmtree(probe_path)
-                
-            # Cleanup Cached DEM
-            if master_dem_path.exists():
-                master_dem_path.unlink()
-            xml_sidecar = master_dem_path.with_name(master_dem_path.name + ".aux.xml")
-            if xml_sidecar.exists():
-                xml_sidecar.unlink()
-
-        except Exception as e:
-            status = "FAIL"
-            error_msg = str(e)
-            print(f"❌ Failed: {e}")
-        
-        t_end = time.perf_counter()
-        total_time = t_end - t_start
-        
-        # Log
-        with open(PERFORMANCE_LOG, 'a', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow([idx, rel_x, rel_y, f"{probe_time:.2f}", f"{extract_time:.2f}", f"{total_time:.2f}", extent_area, buffer_used, status, error_msg])
+    # 3. Submit to Ray
+    futures = [process_batch.remote(b, BERN_DEM_5M, CONFIG_TEMPLATE, SIMULATION_DATA_ROOT_DIR, parameters) for b in batches]
+    
+    # 4. Monitor
+    with tqdm(total=len(batches)) as pbar:
+        while futures:
+            done, futures = ray.wait(futures)
+            pbar.update(len(done))
