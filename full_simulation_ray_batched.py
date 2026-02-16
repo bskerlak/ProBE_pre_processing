@@ -405,11 +405,11 @@ class AvaFrameBatchWorker:
                         cfgM = avaframe.in3Utils.cfgUtils.getGeneralConfig(); cfgM['MAIN']['avalancheDir'] = str(sim_path)
                         logger.debug(f"      Starting com1DFA for sim {sim_path}")
                         # ------------------------------------------------------------------------------------------------
-                            com1DFA.com1DFAMain(cfgM, cfgInfo=cfg)
-                            # ------------------------------------------------------------------------------------------------
-                            sim_dur = time.perf_counter() - sim_start
-                            print(f"   ✅ Sim finished for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} in {sim_dur:.2f}s")
-                            log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS", ""])
+                        com1DFA.com1DFAMain(cfgM, cfgInfo=cfg)
+                        # ------------------------------------------------------------------------------------------------
+                        sim_dur = time.perf_counter() - sim_start
+                        print(f"   ✅ Sim finished for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} in {sim_dur:.2f}s")
+                        log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS", ""])
 
                     except Exception as e:
                         sim_dur = time.perf_counter() - sim_start
@@ -451,11 +451,12 @@ if __name__ == "__main__":
     CONFIG_TEMPLATE = "/home/bojan/probe_pre_processing/cfgCom1DFA_template.ini"
     SIM_ROOT = "/home/bojan/probe_data/bern"
     LOCATIONS = "/home/bojan/probe_data/bern/locations_random_1000.gpkg"
-    LOG_FILE = Path(SIM_ROOT) / f"log_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-    RAY_MODE = "local_debug"
+    LOG_FILE = Path(SIM_ROOT) / f"log_start_YMD_HM_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    RAY_MODE = "local_cluster"
     N_RAY_WORKERS = 8
     MAX_IN_FLIGHT = N_RAY_WORKERS * 2  # queue one task for every worker
-    N_LIMIT_LOCATIONS = 1
+    N_LIMIT_LOCATIONS = 10
+    N_LOCATIONS_IN_BATCH = 2
     LOCAL_SINGLE_THREAD_DEBUG_MODE = False
 
     logger = logging.getLogger()
@@ -519,6 +520,8 @@ if __name__ == "__main__":
             ray.init(local_mode=True)
         elif RAY_MODE == "local_cluster":
             ray.init()
+        else:
+            ray.init()
 
     def create_worker(*args, **kwargs):
         # wrapping to enable both local debug without decorator and remote with decorator
@@ -536,46 +539,28 @@ if __name__ == "__main__":
 
     # Prepare INPUT for simulation by setting up the DuckDB batch generator (batch = locations (X/Y))
     # TODO read from S3
-    batch_generator = get_location_batches(LOCATIONS, batch_size=10 , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=True)
+    batch_generator = get_location_batches(LOCATIONS, batch_size=N_LOCATIONS_IN_BATCH , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=None)
+    # TODO set total n locations in case N_LIMIT_LOCATIONS is not set
+    # 1. Use map_unordered to distribute the generator across the 8 actors
+    # This automatically maintains backpressure and keeps all 8 actors busy.
+    result_generator = pool.map_unordered(
+        lambda a, v: a.process_batch.remote(v), 
+        batch_generator
+    )
 
-    in_flight = 0
-    with tqdm(desc="Simulation", unit="Locations") as pbar:
-        while True:
-            # A. Feed the Pool until we hit backpressure limit
-            while in_flight < MAX_IN_FLIGHT:
-                if batch_generator is None:  # if the generator has been exhausted it will be set to None
-                    break
-                try:
-                    batch = next(batch_generator)  # take the next entry from the batch generator
-                    pool.submit(lambda a, v: a.process_batch.remote(v), batch)
-                    in_flight += 1
-                except StopIteration:  # Exhausted the input list (generator "finished")
-                    batch_generator = None # remove the generator
-                    break
-            
-            # B. If everything is submitted and finished, exit
-            if in_flight == 0:
-                break
-            
-            # C. Collect results as they finish
+    with tqdm(desc="Simulation", unit=" locations", total=N_LIMIT_LOCATIONS) as pbar:
+        # 2. Iterate directly over the result generator
+        # This loop only advances when an actor finishes a batch
+        for batch_results in result_generator:
             try:
-                # get_next() waits for the next available result
-                batch_results = pool.get_next()
-                in_flight -= 1
+                # 3. Incremental Save
+                written = save_batch_to_csv(batch_results, LOG_FILE)
                 
-                # D. Incremental save: append results to CSV log file
-                try:
-                    written = save_batch_to_csv(batch_results, LOG_FILE)
-                    print(f"📥 Appended {written} rows to log {LOG_FILE}")
-                except Exception as e:
-                    print(f"⚠️ Failed to write batch to log: {e}")
-
+                # 4. Update Progress
                 pbar.update(len(batch_results))
                 
             except Exception as e:
-                print(f"⚠️ Worker error: {e}")
-                in_flight -= 1 # Prevent deadlocks on failed tasks
+                print(f"⚠️ Error processing result batch: {e}")
 
-    print("✅ Processing complete.")
     total_dur = time.perf_counter() - total_start
-    print(f"⏱️ Total run time: {total_dur:.2f}s")
+    print(f"✅ Processing all complete. Total run time: {total_dur:.2f}s ⏱️")
