@@ -86,7 +86,7 @@ def save_batch_to_csv(rows, logfile_path):
     Each row should be: [idx, x, y, area, relTh, mu, xsi, tau0, status, message]
     """
     logfile_path = Path(logfile_path)
-    header = ['idx', 'x', 'y', 'area', 'relTh', 'mu', 'xsi', 'tau0', 'status', 'message']
+    header = ['idx', 'x', 'y', 'area', 'relTh', 'mu', 'xsi', 'tau0', 'duration', 'status', 'message']
     write_header = not logfile_path.exists()
     logfile_path.parent.mkdir(parents=True, exist_ok=True)
     with open(logfile_path, 'a', newline='') as fh:
@@ -405,20 +405,20 @@ class AvaFrameBatchWorker:
                         cfgM = avaframe.in3Utils.cfgUtils.getGeneralConfig(); cfgM['MAIN']['avalancheDir'] = str(sim_path)
                         logger.debug(f"      Starting com1DFA for sim {sim_path}")
                         # ------------------------------------------------------------------------------------------------
-                        com1DFA.com1DFAMain(cfgM, cfgInfo=cfg)
-                        # ------------------------------------------------------------------------------------------------
-                        sim_dur = time.perf_counter() - sim_start
-                        print(f"   ✅ Sim finished for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} in {sim_dur:.2f}s")
-                        log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], "SUCCESS", ""])
+                            com1DFA.com1DFAMain(cfgM, cfgInfo=cfg)
+                            # ------------------------------------------------------------------------------------------------
+                            sim_dur = time.perf_counter() - sim_start
+                            print(f"   ✅ Sim finished for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} in {sim_dur:.2f}s")
+                            log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS", ""])
 
                     except Exception as e:
                         sim_dur = time.perf_counter() - sim_start
                         print(f"   ❌ Sim failed for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} after {sim_dur:.2f}s: {e}")
-                        log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], "FAIL", str(e)])
+                        log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "FAIL", str(e)])
                 else:
                     sim_dur = time.perf_counter() - sim_start
                     print(f"   🔁 Skipped worst-case sim (✅ lead simulation already calculated) for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} ({sim_dur:.2f}s)")
-                    log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], "SUCCESS_LEAD", ""])
+                    log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS_LEAD", ""])
                 
                 successful_sim_paths.append(sim_path)
 
@@ -435,7 +435,8 @@ class AvaFrameBatchWorker:
             print(f"📍 Location idx={idx} completed in {loc_dur:.2f}s")
 
         except Exception as e:
-            log_list.append([idx, x, y, 0, 0, 0, 0, 0, "CRITICAL_ERROR", str(e)])
+            # duration unknown for critical errors - record as 0
+            log_list.append([idx, x, y, 0, 0, 0, 0, 0, 0, "CRITICAL_ERROR", str(e)])
             raise
         return log_list
     
