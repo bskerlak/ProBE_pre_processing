@@ -23,6 +23,7 @@ import configparser
 import csv
 import logging
 import time
+import pprint
 from pathlib import Path
 from datetime import datetime
 
@@ -53,7 +54,7 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
     """
 
     # --- OVERRIDE LOGIC ---
-    if anriss0005_flag is not None:
+    if anriss0005_flag:
         # Yield a single batch containing only the target coordinate
         # The structure is a list of tuples: [(id, x, y)]
         print(f"🎯 Anriss0005Flag active: Yielding single test location (2608198, 1145230)")
@@ -83,10 +84,10 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
 def save_batch_to_csv(rows, logfile_path):
     """Append simulation log rows to `logfile_path` as CSV.
 
-    Each row should be: [idx, x, y, area, relTh, mu, xsi, tau0, status, message]
+    Each row should be: [loc_idx, x, y, area, relTh, mu, xsi, tau0, status, message]
     """
     logfile_path = Path(logfile_path)
-    header = ['idx', 'x', 'y', 'area', 'relTh', 'mu', 'xsi', 'tau0', 'duration', 'status', 'message']
+    header = ['loc_idx', 'x', 'y', 'area', 'relTh', 'mu', 'xsi', 'tau0', 'duration', 'status', 'message']
     write_header = not logfile_path.exists()
     logfile_path.parent.mkdir(parents=True, exist_ok=True)
     with open(logfile_path, 'a', newline='') as fh:
@@ -368,10 +369,10 @@ class AvaFrameBatchWorker:
         return results
     
     def process_location(self, location_data):
-        idx, x, y = location_data
+        loc_idx, x, y = location_data
         log_list, successful_sim_paths = [], []
         loc_start = time.perf_counter()
-        print(f"📍 Start location idx={idx} ({x},{y})")
+        print(f"📍 Start location idx (x,y)={loc_idx} ({x},{y})")
         try:          
             # 1. Get DEM for this location
             DEM_worst_case_simulation_path, worst_case_simulation_extent, buffer = self.anriss_manager.get_DEM_for_location(x, y)
@@ -409,16 +410,16 @@ class AvaFrameBatchWorker:
                         # ------------------------------------------------------------------------------------------------
                         sim_dur = time.perf_counter() - sim_start
                         print(f"   ✅ Sim finished for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} in {sim_dur:.2f}s")
-                        log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS", ""])
+                        log_list.append([loc_idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS", ""])
 
                     except Exception as e:
                         sim_dur = time.perf_counter() - sim_start
                         print(f"   ❌ Sim failed for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} after {sim_dur:.2f}s: {e}")
-                        log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "FAIL", str(e)])
+                        log_list.append([loc_idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "FAIL", str(e)])
                 else:
                     sim_dur = time.perf_counter() - sim_start
                     print(f"   🔁 Skipped worst-case sim (✅ lead simulation already calculated) for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} ({sim_dur:.2f}s)")
-                    log_list.append([idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS_LEAD", ""])
+                    log_list.append([loc_idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS_LEAD", ""])
                 
                 successful_sim_paths.append(sim_path)
 
@@ -432,11 +433,11 @@ class AvaFrameBatchWorker:
             #print(f"✅ Generated MaxDepth GeoTIFF for ({x}, {y}) (merged={merged}, time={merge_dur:.2f}s)")
 
             loc_dur = time.perf_counter() - loc_start
-            print(f"📍 Location idx={idx} completed in {loc_dur:.2f}s")
+            print(f"📍 Simulations for location idx={loc_idx} (x,y)=({x},{y}) completed in {loc_dur:.2f}s")
 
         except Exception as e:
             # duration unknown for critical errors - record as 0
-            log_list.append([idx, x, y, 0, 0, 0, 0, 0, 0, "CRITICAL_ERROR", str(e)])
+            log_list.append([loc_idx, x, y, 0, 0, 0, 0, 0, 0, "CRITICAL_ERROR", str(e)])
             raise
         return log_list
     
@@ -451,13 +452,14 @@ if __name__ == "__main__":
     CONFIG_TEMPLATE = "/home/bojan/probe_pre_processing/cfgCom1DFA_template.ini"
     SIM_ROOT = "/home/bojan/probe_data/bern"
     LOCATIONS = "/home/bojan/probe_data/bern/locations_random_1000.gpkg"
-    LOG_FILE = Path(SIM_ROOT) / f"log_start_YMD_HM_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    LOG_FILE = Path(SIM_ROOT) / f"log_started_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     RAY_MODE = "local_cluster"
     N_RAY_WORKERS = 8
     MAX_IN_FLIGHT = N_RAY_WORKERS * 2  # queue one task for every worker
-    N_LIMIT_LOCATIONS = 10
+    N_LIMIT_LOCATIONS = 100
     N_LOCATIONS_IN_BATCH = 2
     LOCAL_SINGLE_THREAD_DEBUG_MODE = False
+    ANRISS0005_FLAG = None
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -496,9 +498,17 @@ if __name__ == "__main__":
         print("using AvaFrameBatchWorker directly, no remote, no ncpu")
         WorkerClass = AvaFrameBatchWorker
         # Manually call the method
-        test_location = [(0, 2608198, 1145230)]
-        test_location = [(0, 2608200, 1145235)]
-        debug_worker = WorkerClass(BE_DEM_5M, CONFIG_TEMPLATE, SIM_ROOT, sorted_params)
+        manual_override_params_sorted = {
+            'area': [200],
+            'relTh': [0.75],
+            'mu': [0.375],
+            'xsi': [1250],
+            'tau0': [1500],
+        }
+        #test_location = [(0, 2608198, 1145230)]  # Anriss0005
+        #test_location = [(0, 2608200, 1145235)]
+        test_location = [(0, 2623655, 1202157)]
+        debug_worker = WorkerClass(BE_DEM_5M, CONFIG_TEMPLATE, SIM_ROOT, manual_override_params_sorted)
         results = debug_worker.process_batch(test_location)
         try:
             written = save_batch_to_csv(results, LOG_FILE)
@@ -539,17 +549,32 @@ if __name__ == "__main__":
 
     # Prepare INPUT for simulation by setting up the DuckDB batch generator (batch = locations (X/Y))
     # TODO read from S3
-    batch_generator = get_location_batches(LOCATIONS, batch_size=N_LOCATIONS_IN_BATCH , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=None)
     # TODO set total n locations in case N_LIMIT_LOCATIONS is not set
-    # 1. Use map_unordered to distribute the generator across the 8 actors
+    batch_generator = get_location_batches(LOCATIONS, batch_size=N_LOCATIONS_IN_BATCH , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=ANRISS0005_FLAG)
+    # dry run: get the first 10 entries of the batch generator and print them
+    for i in range(10):
+        try:
+            batch = next(batch_generator)
+        except StopIteration:
+            print('--- StopIteration: generator exhausted ---')
+            break
+        except Exception as e:
+            print('NEXT_ERROR', e)
+            break
+        print(f'--- Batch {i+1} (len={len(batch)}) ---')
+        pprint.pprint(batch)
+    # real run
+    batch_generator = get_location_batches(LOCATIONS, batch_size=N_LOCATIONS_IN_BATCH , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=ANRISS0005_FLAG)
+    
+    # 1. SEND: Use map_unordered to distribute the generator across the 8 actors
     # This automatically maintains backpressure and keeps all 8 actors busy.
     result_generator = pool.map_unordered(
         lambda a, v: a.process_batch.remote(v), 
         batch_generator
     )
 
-    with tqdm(desc="Simulation", unit=" locations", total=N_LIMIT_LOCATIONS) as pbar:
-        # 2. Iterate directly over the result generator
+    with tqdm(desc="Simulation", unit=" simulations", total=N_LIMIT_LOCATIONS) as pbar:
+        # 2. COLLECT: Iterate directly over the result generator
         # This loop only advances when an actor finishes a batch
         for batch_results in result_generator:
             try:
