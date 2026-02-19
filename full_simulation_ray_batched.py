@@ -333,8 +333,8 @@ class AvaFrameAnrissManager:
             buffer = 0
             return dem_path, extent, buffer
 
-        # ------------------------------------------------------------------------
-        # Not cached: run a lead sim to compute tight extent and create the DEM
+        # ----------------------------------------------------------------------------------------
+        # DEM is not available in cache: run a lead sim to compute tight extent and create the DEM
         dem_path.parent.mkdir(parents=True, exist_ok=True)
         extent, buffer = self.run_lead_sim(x, y)
         self.extract_ascii_raster_from_master_dem(dem_path, extent)
@@ -459,7 +459,8 @@ if __name__ == "__main__":
     N_LIMIT_LOCATIONS = 100
     N_LOCATIONS_IN_BATCH = 2
     LOCAL_SINGLE_THREAD_DEBUG_MODE = False
-    ANRISS0005_FLAG = None
+    ANRISS0005_FLAG = True
+    SIM_ROOT = "/home/bojan/probe_data/bern_anriss0005"
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
