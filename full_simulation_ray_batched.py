@@ -75,11 +75,13 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
 
     cursor = con.execute(query)
     
+    batch_id = 0
     while True:
         batch = cursor.fetchmany(batch_size)
         if not batch:
             break
-        yield batch
+        yield (batch_id, batch)
+        batch_id += 1
 
 def save_batch_to_csv(rows, logfile_path):
     """Append simulation log rows to `logfile_path` as CSV.
@@ -355,20 +357,28 @@ class AvaFrameBatchWorker:
             l.setLevel(logging.WARNING) # Only show errors or warnings
             l.propagate = False         # Prevent them from sending logs up to your s
 
-    def process_batch(self, batch):
+    def process_batch(self, batch_data):
         """ 
-        Batch = collection of locations (x, y)
+        Batch = (batch_id, collection of locations (x, y)) 
         """
+        batch_id, locations = batch_data
         batch_start = time.perf_counter()
-        print(f"📦 Processing batch of {len(batch)} locations")
+
+        # Create a unique directory for this batch
+        batch_dir_name = f"batch_{batch_id:04d}"
+        batch_output_path = self.simulation_base_path / batch_dir_name
+        batch_output_path.mkdir(parents=True, exist_ok=True)
+
+        print(f"📦 Processing {batch_dir_name} ({len(locations)} locations)")
         results = []
-        for location in batch:
-            results.extend(self.process_location(location))
+        for location in locations:
+            # Pass the batch_dir_name down to process_location
+            results.extend(self.process_location(location, batch_dir_name))
         batch_duration = time.perf_counter() - batch_start
-        print(f"📦 Batch processed in {batch_duration:.2f}s")
+        print(f"📦 Batch {batch_dir_name} ({len(locations)} locations) processed in {batch_duration:.2f}s")
         return results
     
-    def process_location(self, location_data):
+    def process_location(self, location_data, batch_dir_name):
         loc_idx, x, y = location_data
         log_list, successful_sim_paths = [], []
         loc_start = time.perf_counter()
@@ -388,7 +398,7 @@ class AvaFrameBatchWorker:
                 logger.debug(f"   -> Preparing sim for params: {parameter_combination}")
                 sim_start = time.perf_counter()
                 p = parameter_combination
-                sim_path = self.simulation_base_path / f"Sim_X{x}_Y{y}_A{p['area']}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
+                sim_path = self.simulation_base_path / batch_dir_name / f"Sim_X{x}_Y{y}_A{p['area']}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
                 
                 if parameter_combination != self.worst_case_params:
                     try:
@@ -569,10 +579,11 @@ if __name__ == "__main__":
     
     # 1. SEND: Use map_unordered to distribute the generator across the 8 actors
     # This automatically maintains backpressure and keeps all 8 actors busy.
+    # The 'v' here is now the (batch_id, batch_list) tuple
     result_generator = pool.map_unordered(
-        lambda a, v: a.process_batch.remote(v), 
-        batch_generator
-    )
+       lambda worker, job_data: worker.process_batch.remote(job_data), 
+    batch_generator
+)
 
     with tqdm(desc="Simulation", unit=" simulations", total=N_LIMIT_LOCATIONS) as pbar:
         # 2. COLLECT: Iterate directly over the result generator
