@@ -58,7 +58,8 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
         # Yield a single batch containing only the target coordinate
         # The structure is a list of tuples: [(id, x, y)]
         print(f"🎯 Anriss0005Flag active: Yielding single test location (2608198, 1145230)")
-        yield [(0, 2608198, 1145230)] # Anriss0005 from all performance tests
+        # Provide the same (batch_id, batch) structure as normal operation
+        yield (0, [(0, 2608198, 1145230)]) # Anriss0005 from all performance tests
         return # Stop the generator here
     
     con = duckdb.connect()
@@ -375,7 +376,7 @@ class AvaFrameBatchWorker:
             # Pass the batch_dir_name down to process_location
             results.extend(self.process_location(location, batch_dir_name))
         batch_duration = time.perf_counter() - batch_start
-        print(f"📦 Batch {batch_dir_name} ({len(locations)} locations) processed in {batch_duration:.2f}s")
+        print(f"📦 Batch ID {batch_id} in dir {batch_dir_name} ({len(locations)} locations) processed in {batch_duration:.2f}s")
         return results
     
     def process_location(self, location_data, batch_dir_name):
@@ -579,11 +580,10 @@ if __name__ == "__main__":
     
     # 1. SEND: Use map_unordered to distribute the generator across the 8 actors
     # This automatically maintains backpressure and keeps all 8 actors busy.
-    # The 'v' here is now the (batch_id, batch_list) tuple
+    # The 'job_data' here is now the (batch_id, batch_list) tuple
     result_generator = pool.map_unordered(
-       lambda worker, job_data: worker.process_batch.remote(job_data), 
-    batch_generator
-)
+       lambda worker, job_data: worker.process_batch.remote(job_data), batch_generator
+    )
 
     with tqdm(desc="Simulation", unit=" simulations", total=N_LIMIT_LOCATIONS) as pbar:
         # 2. COLLECT: Iterate directly over the result generator
