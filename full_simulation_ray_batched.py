@@ -471,8 +471,7 @@ if __name__ == "__main__":
     N_LOCATIONS_IN_BATCH = 2
     LOCAL_SINGLE_THREAD_DEBUG_MODE = False
     ANRISS0005_FLAG = True
-    ROOT_DIR = "/home/bojan/probe_data/bern_anriss0005"
-
+    
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     handler = logging.StreamHandler(sys.stdout)
