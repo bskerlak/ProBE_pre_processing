@@ -386,6 +386,7 @@ class AvaFrameBatchWorker:
         print(f"📍 Start location idx (x,y)={loc_idx} ({x},{y})")
         try:          
             # 1. Get DEM for this location
+            self.anriss_manager.simulation_base_path = self.simulation_base_path / batch_dir_name # add batch name to anriss manager so the lead simulation gets stored in the right batch
             DEM_worst_case_simulation_path, worst_case_simulation_extent, buffer = self.anriss_manager.get_DEM_for_location(x, y)
             self.anriss_manager.extract_ascii_raster_from_master_dem(DEM_worst_case_simulation_path, worst_case_simulation_extent)
 
@@ -458,12 +459,11 @@ if __name__ == "__main__":
     # 0) CONFIG
     # ===========================================================================================================
     total_start = time.perf_counter()
-
     BE_DEM_5M = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned_5km_buffer_COG_cropped.tif"
     CONFIG_TEMPLATE = "/home/bojan/probe_pre_processing/cfgCom1DFA_template.ini"
-    SIM_ROOT = "/home/bojan/probe_data/bern"
+    ROOT_DIR = "/home/bojan/probe_data/bern"
     LOCATIONS = "/home/bojan/probe_data/bern/locations_random_1000.gpkg"
-    LOG_FILE = Path(SIM_ROOT) / f"log_started_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    LOG_FILE = Path(ROOT_DIR) / f"log_started_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     RAY_MODE = "local_cluster"
     N_RAY_WORKERS = 8
     MAX_IN_FLIGHT = N_RAY_WORKERS * 2  # queue one task for every worker
@@ -471,7 +471,7 @@ if __name__ == "__main__":
     N_LOCATIONS_IN_BATCH = 2
     LOCAL_SINGLE_THREAD_DEBUG_MODE = False
     ANRISS0005_FLAG = True
-    SIM_ROOT = "/home/bojan/probe_data/bern_anriss0005"
+    ROOT_DIR = "/home/bojan/probe_data/bern_anriss0005"
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -520,7 +520,7 @@ if __name__ == "__main__":
         #test_location = [(0, 2608198, 1145230)]  # Anriss0005
         #test_location = [(0, 2608200, 1145235)]
         test_location = [(0, 2623655, 1202157)]
-        debug_worker = WorkerClass(BE_DEM_5M, CONFIG_TEMPLATE, SIM_ROOT, manual_override_params_sorted)
+        debug_worker = WorkerClass(BE_DEM_5M, CONFIG_TEMPLATE, ROOT_DIR, manual_override_params_sorted)
         results = debug_worker.process_batch(test_location)
         try:
             written = save_batch_to_csv(results, LOG_FILE)
@@ -552,7 +552,7 @@ if __name__ == "__main__":
     # N_RAY_WORKERS = int(ray.available_resources().get("CPU", 4))
     print(f"Setting up {N_RAY_WORKERS} Ray Workers ...")
     WorkerClass = ray.remote(num_cpus=1)(AvaFrameBatchWorker)
-    workers = [create_worker(BE_DEM_5M, CONFIG_TEMPLATE, SIM_ROOT, sorted_params) for i in range(N_RAY_WORKERS)]
+    workers = [create_worker(BE_DEM_5M, CONFIG_TEMPLATE, ROOT_DIR, sorted_params) for i in range(N_RAY_WORKERS)]
     pool = ActorPool(workers)
 
     # ===========================================================================================================
