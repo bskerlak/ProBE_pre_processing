@@ -1,6 +1,7 @@
 import os
 import sys
 import shutil
+import glob
 
 # math, GIS
 import math
@@ -87,10 +88,10 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
 def save_batch_to_csv(rows, logfile_path):
     """Append simulation log rows to `logfile_path` as CSV.
 
-    Each row should be: [loc_idx, x, y, area, relTh, mu, xsi, tau0, status, message]
+    Each row should be: [batch_id, loc_idx, x, y, area, relTh, mu, xsi, tau0, duration, status, message]
     """
     logfile_path = Path(logfile_path)
-    header = ['loc_idx', 'x', 'y', 'area', 'relTh', 'mu', 'xsi', 'tau0', 'duration', 'status', 'message']
+    header = ['batch_id', 'loc_idx', 'x', 'y', 'area', 'relTh', 'mu', 'xsi', 'tau0', 'duration', 'status', 'message']
     write_header = not logfile_path.exists()
     logfile_path.parent.mkdir(parents=True, exist_ok=True)
     with open(logfile_path, 'a', newline='') as fh:
@@ -324,16 +325,18 @@ class AvaFrameAnrissManager:
                     if not line:
                         break
                     header[line[0].lower()] = float(line[1])
-
-            x_min = header.get('xllcorner')
-            y_min = header.get('yllcorner')
-            ncols = int(header.get('ncols'))
-            nrows = int(header.get('nrows'))
-            cellsize = header.get('cellsize')
-            x_max = x_min + (ncols * cellsize)
-            y_max = y_min + (nrows * cellsize)
-            extent = [x_min, x_max, y_min, y_max]
-            buffer = 0
+            try:
+                x_min = header.get('xllcorner')
+                y_min = header.get('yllcorner')
+                ncols = int(header.get('ncols'))
+                nrows = int(header.get('nrows'))
+                cellsize = header.get('cellsize')
+                x_max = x_min + (ncols * cellsize)
+                y_max = y_min + (nrows * cellsize)
+                extent = [x_min, x_max, y_min, y_max]
+                buffer = 0
+            except Exception as e:
+                print(f"Error when opening DEM {dem_path}: {e}")
             return dem_path, extent, buffer
 
         # ----------------------------------------------------------------------------------------
@@ -358,7 +361,7 @@ class AvaFrameBatchWorker:
             l.setLevel(logging.WARNING) # Only show errors or warnings
             l.propagate = False         # Prevent them from sending logs up to your s
 
-    def process_batch(self, batch_data):
+    def process_batch(self, batch_data, overwrite=False):
         """ 
         Batch = (batch_id, collection of locations (x, y)) 
         """
@@ -371,15 +374,32 @@ class AvaFrameBatchWorker:
         batch_output_path.mkdir(parents=True, exist_ok=True)
 
         print(f"📦 Processing {batch_dir_name} ({len(locations)} locations)")
+        # check if batch already processes
+        def batch_already_processed(batch_output_path):
+            data_lake_silver_path = Path(batch_output_path) / "batch_data_lake_silver" / "batch_merged_silver.parquet"
+            data_lake_silver_present = data_lake_silver_path.exists()
+            data_lake_bronze_path = Path(batch_output_path) / "batch_data_lake_bronze"
+            data_lake_bronze_present = data_lake_bronze_path.exists() and data_lake_bronze_path.is_dir()
+            has_Sim_dirs = len(glob.glob("batch_output_path/Sim*")) > 0
+            if data_lake_silver_present and not data_lake_bronze_present and not has_Sim_dirs:
+                return True
+            return False
+        if batch_already_processed(batch_output_path) and not overwrite:
+            log_list = []
+            log_list.append([batch_id, -999, -999, -999, -999, -999, -999, -999, -999, -999, "SKIPPED_BATCH", "silver data lake already present, overwrite = False"])
+            return log_list
+        else:
+            pass  # overwrite batch
+
         results = []
         for location in locations:
-            # Pass the batch_dir_name down to process_location
-            results.extend(self.process_location(location, batch_dir_name))
+            # Pass the batch_dir_name and numeric batch_id down to process_location
+            results.extend(self.process_location(location, batch_dir_name, batch_id))
         batch_duration = time.perf_counter() - batch_start
         print(f"📦 Batch ID {batch_id} in dir {batch_dir_name} ({len(locations)} locations) processed in {batch_duration:.2f}s")
         return results
     
-    def process_location(self, location_data, batch_dir_name):
+    def process_location(self, location_data, batch_dir_name, batch_id):
         loc_idx, x, y = location_data
         log_list, successful_sim_paths = [], []
         loc_start = time.perf_counter()
@@ -422,16 +442,16 @@ class AvaFrameBatchWorker:
                         # ------------------------------------------------------------------------------------------------
                         sim_dur = time.perf_counter() - sim_start
                         print(f"   ✅ Sim finished for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} in {sim_dur:.2f}s")
-                        log_list.append([loc_idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS", ""])
+                        log_list.append([batch_id, loc_idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS", ""])
 
                     except Exception as e:
                         sim_dur = time.perf_counter() - sim_start
                         print(f"   ❌ Sim failed for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} after {sim_dur:.2f}s: {e}")
-                        log_list.append([loc_idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "FAIL", str(e)])
+                        log_list.append([batch_id, loc_idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "FAIL", str(e)])
                 else:
                     sim_dur = time.perf_counter() - sim_start
                     print(f"   🔁 Skipped worst-case sim (✅ lead simulation already calculated) for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} ({sim_dur:.2f}s)")
-                    log_list.append([loc_idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS_LEAD", ""])
+                    log_list.append([batch_id, loc_idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS_LEAD", ""])
                 
                 successful_sim_paths.append(sim_path)
 
@@ -449,7 +469,7 @@ class AvaFrameBatchWorker:
 
         except Exception as e:
             # duration unknown for critical errors - record as 0
-            log_list.append([loc_idx, x, y, 0, 0, 0, 0, 0, 0, "CRITICAL_ERROR", str(e)])
+            log_list.append([batch_id, loc_idx, x, y, 0, 0, 0, 0, 0, 0, "CRITICAL_ERROR", str(e)])
             raise
         return log_list
     
@@ -458,19 +478,21 @@ if __name__ == "__main__":
     # ===========================================================================================================
     # 0) CONFIG
     # ===========================================================================================================
+    ROOT_DIR = "/home/bojan/probe_data/bern500"
+    LOCAL_SINGLE_THREAD_DEBUG_MODE = False
+    ANRISS0005_FLAG = False
+    if LOCAL_SINGLE_THREAD_DEBUG_MODE:
+        ROOT_DIR = "/home/bojan/probe_data/local_debug"
     total_start = time.perf_counter()
     BE_DEM_5M = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned_5km_buffer_COG_cropped.tif"
     CONFIG_TEMPLATE = "/home/bojan/probe_pre_processing/cfgCom1DFA_template.ini"
-    ROOT_DIR = "/home/bojan/probe_data/bern"
     LOCATIONS = "/home/bojan/probe_data/bern/locations_random_1000.gpkg"
     LOG_FILE = Path(ROOT_DIR) / f"log_started_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     RAY_MODE = "local_cluster"
     N_RAY_WORKERS = 8
     MAX_IN_FLIGHT = N_RAY_WORKERS * 2  # queue one task for every worker
-    N_LIMIT_LOCATIONS = 100
-    N_LOCATIONS_IN_BATCH = 2
-    LOCAL_SINGLE_THREAD_DEBUG_MODE = False
-    ANRISS0005_FLAG = True
+    N_LIMIT_LOCATIONS = 500
+    N_LOCATIONS_IN_BATCH = 10
     
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -510,15 +532,15 @@ if __name__ == "__main__":
         WorkerClass = AvaFrameBatchWorker
         # Manually call the method
         manual_override_params_sorted = {
-            'area': [200],
-            'relTh': [0.75],
-            'mu': [0.375],
+            'area': [1500],
+            'relTh': [3],
+            'mu': [0.25],
             'xsi': [1250],
             'tau0': [1500],
         }
-        #test_location = [(0, 2608198, 1145230)]  # Anriss0005
-        #test_location = [(0, 2608200, 1145235)]
-        test_location = [(0, 2623655, 1202157)]
+        # (batch id [(location id, x, y)])
+        test_location = (0, [(0, 2630808, 1184548)]) 
+    
         debug_worker = WorkerClass(BE_DEM_5M, CONFIG_TEMPLATE, ROOT_DIR, manual_override_params_sorted)
         results = debug_worker.process_batch(test_location)
         try:
@@ -563,6 +585,7 @@ if __name__ == "__main__":
     # TODO set total n locations in case N_LIMIT_LOCATIONS is not set
     batch_generator = get_location_batches(LOCATIONS, batch_size=N_LOCATIONS_IN_BATCH , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=ANRISS0005_FLAG)
     # dry run: get the first 10 entries of the batch generator and print them
+    print(f"Running dry run: showing first 10 batches")
     for i in range(10):
         try:
             batch = next(batch_generator)
@@ -575,6 +598,7 @@ if __name__ == "__main__":
         print(f'--- Batch {i+1} (len={len(batch)}) ---')
         pprint.pprint(batch)
     # real run
+    print(f"Now starting real run")
     batch_generator = get_location_batches(LOCATIONS, batch_size=N_LOCATIONS_IN_BATCH , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=ANRISS0005_FLAG)
     
     # 1. SEND: Use map_unordered to distribute the generator across the 8 actors
