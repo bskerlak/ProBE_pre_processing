@@ -383,7 +383,8 @@ class AvaFrameBatchWorker:
             has_Sim_dirs = len(glob.glob("batch_output_path/Sim*")) > 0
             if data_lake_silver_present and not data_lake_bronze_present and not has_Sim_dirs:
                 return True
-            return False
+            else:
+                return False
         if batch_already_processed(batch_output_path) and not overwrite:
             log_list = []
             log_list.append([batch_id, -999, -999, -999, -999, -999, -999, -999, -999, -999, "SKIPPED_BATCH", "silver data lake already present, overwrite = False"])
