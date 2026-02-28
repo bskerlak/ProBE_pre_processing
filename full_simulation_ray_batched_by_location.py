@@ -423,7 +423,7 @@ class AvaFrameBatchWorker:
                 p = parameter_combination
                 sim_path = self.simulation_base_path / batch_dir_name / f"Sim_X{x}_Y{y}_A{p['area']}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
                 
-                if parameter_combination != self.worst_case_params:
+                if parameter_combination != self.worst_case_params or True:
                     try:
                         input_dir = self.anriss_manager.setup_dirs(sim_path)
                         shutil.copy2(DEM_worst_case_simulation_path, input_dir / "dem.asc")
@@ -479,9 +479,9 @@ if __name__ == "__main__":
     # ===========================================================================================================
     # 0) CONFIG
     # ===========================================================================================================
-    ROOT_DIR = "/home/bojan/probe_data/bern500"
+    ROOT_DIR = "/home/bojan/probe_data/bern8"
     LOCAL_SINGLE_THREAD_DEBUG_MODE = False
-    ANRISS0005_FLAG = False
+    ANRISS0005_FLAG = None
     if LOCAL_SINGLE_THREAD_DEBUG_MODE:
         ROOT_DIR = "/home/bojan/probe_data/local_debug"
     total_start = time.perf_counter()
@@ -492,8 +492,8 @@ if __name__ == "__main__":
     RAY_MODE = "local_cluster"
     N_RAY_WORKERS = 8
     MAX_IN_FLIGHT = N_RAY_WORKERS * 2  # queue one task for every worker
-    N_LIMIT_LOCATIONS = 500
-    N_LOCATIONS_IN_BATCH = 10
+    N_LIMIT_LOCATIONS = 8
+    N_LOCATIONS_IN_BATCH = 1
     
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -509,9 +509,9 @@ if __name__ == "__main__":
 
     # Simulation parameters
     raw_params = {
-        'area': [200, 400, 1500],
+        'area': [25],
         'relTh': [0.75, 1, 3],
-        'mu': [0.05, 0.25, 0.375],
+        'mu': [0.05, 0.25, 0.375],  
         'xsi': [200, 600, 1250],
         'tau0': [500, 1500],
     }
@@ -533,14 +533,15 @@ if __name__ == "__main__":
         WorkerClass = AvaFrameBatchWorker
         # Manually call the method
         manual_override_params_sorted = {
-            'area': [1500],
-            'relTh': [3],
-            'mu': [0.25],
-            'xsi': [1250],
-            'tau0': [1500],
+            'area': [200],
+            'relTh': [3, 1, 0.75],
+            'mu': [0.05, 0.25, 0.375],
+            'xsi': [1250, 600, 200],
+            'tau0': [500, 1500],
         }
         # (batch id [(location id, x, y)])
         test_location = (0, [(0, 2630808, 1184548)]) 
+        test_location = (0, [(0, 2608198, 1145230)]) # Anriss0005 from all performance tests
     
         debug_worker = WorkerClass(BE_DEM_5M, CONFIG_TEMPLATE, ROOT_DIR, manual_override_params_sorted)
         results = debug_worker.process_batch(test_location)
