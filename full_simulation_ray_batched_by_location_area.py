@@ -425,13 +425,13 @@ class AvaFrameBatchWorker:
                 logger.debug(f"   -> Preparing sim for params: {parameter_combination}")
                 sim_start = time.perf_counter()
                 p = parameter_combination
-                sim_path = self.simulation_base_path / batch_dir_name / f"Sim_X{x}_Y{y}_A{p['area']}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
+                sim_path = self.simulation_base_path / batch_dir_name / f"Sim_X{x}_Y{y}_A{area}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
                 
                 if parameter_combination != self.worst_case_params or True:
                     try:
                         input_dir = self.anriss_manager.setup_dirs(sim_path)
                         shutil.copy2(DEM_worst_case_simulation_path, input_dir / "dem.asc")
-                        radius = math.sqrt(p['area'] / math.pi)
+                        radius = math.sqrt(area / math.pi)
                         circle = Point(x, y).buffer(radius, quad_segs=16)
                         rel_path = input_dir / "REL" / "rel.shp"
                         gpd.GeoDataFrame([{'geometry': circle, 'id': 'rel_0'}], crs="EPSG:2056").to_file(rel_path)
@@ -446,17 +446,17 @@ class AvaFrameBatchWorker:
                         com1DFA.com1DFAMain(cfgM, cfgInfo=cfg)
                         # ------------------------------------------------------------------------------------------------
                         sim_dur = time.perf_counter() - sim_start
-                        print(f"   ✅ Sim finished for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} in {sim_dur:.2f}s")
-                        log_list.append([batch_id, loc_idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS", ""])
+                        print(f"   ✅ Sim finished for area={area} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} in {sim_dur:.2f}s")
+                        log_list.append([batch_id, loc_idx, x, y, area, p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS", ""])
 
                     except Exception as e:
                         sim_dur = time.perf_counter() - sim_start
-                        print(f"   ❌ Sim failed for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} after {sim_dur:.2f}s: {e}")
-                        log_list.append([batch_id, loc_idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "FAIL", str(e)])
+                        print(f"   ❌ Sim failed for area={area} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} after {sim_dur:.2f}s: {e}")
+                        log_list.append([batch_id, loc_idx, x, y, area, p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "FAIL", str(e)])
                 else:
                     sim_dur = time.perf_counter() - sim_start
-                    print(f"   🔁 Skipped worst-case sim (✅ lead simulation already calculated) for area={p['area']} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} ({sim_dur:.2f}s)")
-                    log_list.append([batch_id, loc_idx, x, y, p['area'], p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS_LEAD", ""])
+                    print(f"   🔁 Skipped worst-case sim (✅ lead simulation already calculated) for area={area} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} ({sim_dur:.2f}s)")
+                    log_list.append([batch_id, loc_idx, x, y, area, p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS_LEAD", ""])
                 
                 successful_sim_paths.append(sim_path)
 
@@ -513,7 +513,6 @@ if __name__ == "__main__":
 
     # Simulation parameters
     raw_params = {
-        'area': [25],
         'relTh': [0.75, 1, 3],
         'mu': [0.05, 0.25, 0.375],  
         'xsi': [200, 600, 1250],
@@ -521,7 +520,6 @@ if __name__ == "__main__":
     }
     # Sorting ensures index [0] is always the "Worst Case" = "Lead Simulation"
     sorted_params = {
-        'area': sorted(raw_params['area'], reverse=True),
         'relTh': sorted(raw_params['relTh'], reverse=True),
         'mu': sorted(raw_params['mu']),
         'xsi': sorted(raw_params['xsi'], reverse=True),
@@ -545,6 +543,9 @@ if __name__ == "__main__":
         }
         # (batch id [(location id, x, y)])
         test_location_area = (0, [(0, 2630808, 1184548)]) 
+        test_location_area = (0, [(0, 2608198, 1145230, 25)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 50)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 100)]) # Anriss0005 from all performance tests
         test_location_area = (0, [(0, 2608198, 1145230, 200)]) # Anriss0005 from all performance tests
     
         debug_worker = WorkerClass(BE_DEM_5M, CONFIG_TEMPLATE, ROOT_DIR, manual_override_params_sorted)
