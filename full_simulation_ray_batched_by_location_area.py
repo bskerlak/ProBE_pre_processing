@@ -81,6 +81,7 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
         batch = cursor.fetchmany(batch_size)
         if not batch:
             break
+        pass
         yield (batch_id, batch)
         batch_id += 1
 
@@ -111,7 +112,7 @@ class AvaFrameOutputManager:
         self.simulation_base_path = self.root_path / "Simulations"
         self.raster_output_dir = self.simulation_base_path / "summary_stat_rasters"
 
-    def create_stat_rasters(self, x, y, sim_paths, output_dir):
+    def create_stat_rasters(self, x, y, sim_paths):
         """
         Stacks all rasters to calculate Max, Min, and Avg for both Depth and Velocity,
         aligned to the cached DEM master grid.
@@ -122,7 +123,7 @@ class AvaFrameOutputManager:
 
         # 1. Anchor to Cached DEM
         worst_case_str = "_".join([f"{k}{v}" for k, v in self.worst_case_parameters.items()])
-        dem_cache_path = self.root_path / f"DEM_cache_{worst_case_str}" / f"DEM_X{x}_Y{y}.asc"
+        dem_cache_path = self.root_path / f"DEM_cache_{worst_case_str}" / f"DEM_X{x}_Y{y}_Area{area}.asc"
         with rasterio.open(dem_cache_path) as master_src:
             m_trans = master_src.transform
             m_width, m_height = master_src.width, master_src.height
@@ -248,7 +249,7 @@ class AvaFrameAnrissManager:
         if out_path.with_suffix('.prj').exists():
             out_path.with_suffix('.prj').unlink()
 
-    def get_flow_bounds(self, result_ascii, safety_buffer=10):
+    def get_flow_bounds(self, result_ascii, safety_buffer=200):
         # setting default buffer to 10m is a bit arbitrary, just want to avoid problems with boundary pixels
         with rasterio.open(result_ascii) as src:
             data = src.read(1)
@@ -260,7 +261,7 @@ class AvaFrameAnrissManager:
 
     def run_lead_sim(self, x, y, area):
         start_tc = time.perf_counter()
-        print(f"🚀 Running lead simulation for (X, Y) = ({x}, {y}) and area = {area}")
+        print(f"🚀 Running lead simulation for (X, Y, area) = ({x}, {y}, {area})")
         p = self.worst_case_parameters
         sim_path = self.simulation_base_path / f"Sim_X{x}_Y{y}_A{area}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
         input_dir = self.setup_dirs(sim_path)
@@ -309,7 +310,7 @@ class AvaFrameAnrissManager:
         matches = list((sim_path / "Outputs" / "com1DFA" / "peakFiles").glob("*_pft.asc"))
         tight_extent = self.get_flow_bounds(matches[0])
         lead_duration = time.perf_counter() - start_tc
-        print(f"✂️✅ Lead Sim completed in {lead_duration:.2f}s. Tight Extent calculated: {tight_extent} - needed buffer: {buffer}")
+        print(f"✂️✅ Lead Sim completed in {lead_duration:.2f}s. Tight Extent calculated. Needed buffer: +-{buffer}m")
         return [int(np.round(v // 5 * 5)) for v in tight_extent], buffer
 
     def get_DEM_for_location_area(self, x, y, area):
@@ -317,7 +318,7 @@ class AvaFrameAnrissManager:
         Uses a cache directory under the manager's `root_path` named by worst-case params.
         """
         worst_case_str = "_".join([f"{k}{v}" for k, v in self.worst_case_parameters.items()])
-        dem_path = self.root_path / f"DEM_cache_{worst_case_str}" / f"DEM_X{x}_Y{y}_area{area}.asc"
+        dem_path = self.root_path / f"DEM_cache_X{x}_Y{y}_area{area}" / f"DEM_X{x}_Y{y}_area{area}_{worst_case_str}.asc"
 
         if dem_path.exists():
             print(f"🔄 Using existing cache for ({x}, {y}): {dem_path}")
@@ -376,7 +377,7 @@ class AvaFrameBatchWorker:
         batch_output_path = self.simulation_base_path / batch_dir_name
         batch_output_path.mkdir(parents=True, exist_ok=True)
 
-        print(f"📦 Processing {batch_dir_name} ({len(x_y_area)} locations)")
+        print(f"📦 Processing {batch_dir_name} ({len(x_y_area)} locations x area combinations)")
         # check if batch already processes
         def batch_already_processed(batch_output_path):
             data_lake_silver_path = Path(batch_output_path) / "batch_data_lake_silver" / "batch_merged_silver.parquet"
@@ -408,7 +409,7 @@ class AvaFrameBatchWorker:
         loc_idx, x, y, area = location_area_data
         log_list, successful_sim_paths = [], []
         loc_start = time.perf_counter()
-        print(f"📍 Start location idx {loc_idx}, (X, Y) = ({x},{y}), area = {area}")
+        print(f"📍 Start location idx {loc_idx}, (X, Y, area) = ({x}, {y}, {area})")
         try:          
             # 1. Get DEM for this location
             self.anriss_manager.simulation_base_path = self.simulation_base_path / batch_dir_name # add batch name to anriss manager so the lead simulation gets stored in the right batch
@@ -454,20 +455,13 @@ class AvaFrameBatchWorker:
                         print(f"   ❌ Sim failed for area={area} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} after {sim_dur:.2f}s: {e}")
                         log_list.append([batch_id, loc_idx, x, y, area, p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "FAIL", str(e)])
                 else:
+                    pass 
+                    # TODO implement this logic if needed (probably not worth the effort)
                     sim_dur = time.perf_counter() - sim_start
                     print(f"   🔁 Skipped worst-case sim (✅ lead simulation already calculated) for area={area} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} ({sim_dur:.2f}s)")
                     log_list.append([batch_id, loc_idx, x, y, area, p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS_LEAD", ""])
                 
                 successful_sim_paths.append(sim_path)
-
-            # 3. Merge Results into MaxDepth GeoTIFF
-            # TODO replace with output from parquet
-            #summary_tiff_path = self.root_path / "results"
-            #logger.debug(f"   Merging {len(successful_sim_paths)} sim paths into {summary_tiff_path}: {successful_sim_paths}")
-            #merge_start = time.perf_counter()
-            #merged = self.anriss_manager.create_stat_rasters(x, y, successful_sim_paths, summary_tiff_path)
-            #merge_dur = time.perf_counter() - merge_start
-            #print(f"✅ Generated MaxDepth GeoTIFF for ({x}, {y}) (merged={merged}, time={merge_dur:.2f}s)")
 
             loc_dur = time.perf_counter() - loc_start
             print(f"📍 Simulations for location idx={loc_idx} (x,y)=({x},{y}) completed in {loc_dur:.2f}s")
@@ -535,7 +529,6 @@ if __name__ == "__main__":
         WorkerClass = AvaFrameBatchWorker
         # Manually call the method
         manual_override_params_sorted = {
-            'area': [200],
             'relTh': [3, 1, 0.75],
             'mu': [0.05, 0.25, 0.375],
             'xsi': [1250, 600, 200],
@@ -547,6 +540,21 @@ if __name__ == "__main__":
         test_location_area = (0, [(0, 2608198, 1145230, 50)]) # Anriss0005 from all performance tests
         test_location_area = (0, [(0, 2608198, 1145230, 100)]) # Anriss0005 from all performance tests
         test_location_area = (0, [(0, 2608198, 1145230, 200)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 250)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 300)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 400)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 500)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 600)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 700)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 800)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 900)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 1000)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 1500)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 40)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 30)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 25)]) # Anriss0005 from all performance tests
+        test_location_area = (0, [(0, 2608198, 1145230, 900)]) # Anriss0005 from all performance tests
+    
     
         debug_worker = WorkerClass(BE_DEM_5M, CONFIG_TEMPLATE, ROOT_DIR, manual_override_params_sorted)
         results = debug_worker.process_batch(test_location_area)
@@ -627,7 +635,7 @@ if __name__ == "__main__":
                 pbar.update(len(batch_results))
                 
             except Exception as e:
-                print(f"⚠️ Error processing result batch: {e}")
+                print(f"⚠️ Error bresult batch: {e}")
 
     total_dur = time.perf_counter() - total_start
     print(f"✅ Processing all complete. Total run time: {total_dur:.2f}s ⏱️")
