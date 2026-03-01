@@ -57,9 +57,14 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
     # --- OVERRIDE LOGIC ---
     if anriss0005_flag:
         # The structure is a list of tuples: [(id, x, y, area)]
-        print(f"🎯 Anriss0005Flag active: Yielding single test location (2608198, 1145230, 200)")
+        print(f"🎯 Anriss0005Flag active: Yielding {max_locations} copies of the same test location (2608198, 1145230, 200)")
         # Provide the same (batch_id, batch) structure as normal operation
-        yield (0, [(0, 2608198, 1145230, 200)]) # Anriss0005 from all performance tests
+
+        if max_locations is not None:
+            for _ in range(max_locations):
+                yield (0, [(0, 2608198, 1145230, 200)]) # Anriss0005 from all performance tests
+        else:
+            yield (0, [(0, 2608198, 1145230, 200)]) # Anriss0005 from all performance tests
         return # Stop the generator here
     
     con = duckdb.connect()
@@ -249,7 +254,7 @@ class AvaFrameAnrissManager:
         if out_path.with_suffix('.prj').exists():
             out_path.with_suffix('.prj').unlink()
 
-    def get_flow_bounds(self, result_ascii, safety_buffer=200):
+    def get_flow_bounds(self, result_ascii, safety_buffer=10):
         # setting default buffer to 10m is a bit arbitrary, just want to avoid problems with boundary pixels
         with rasterio.open(result_ascii) as src:
             data = src.read(1)
@@ -321,7 +326,7 @@ class AvaFrameAnrissManager:
         dem_path = self.root_path / f"DEM_cache_X{x}_Y{y}_area{area}" / f"DEM_X{x}_Y{y}_area{area}_{worst_case_str}.asc"
 
         if dem_path.exists():
-            print(f"🔄 Using existing cache for ({x}, {y}): {dem_path}")
+            print(f"🔄 Using existing cache for (X, Y, area) = ({x}, {y}, {area}): {dem_path}")
             header = {}
             with open(dem_path, 'r') as f:
                 for _ in range(6):
@@ -478,8 +483,8 @@ if __name__ == "__main__":
     # 0) CONFIG
     # ===========================================================================================================
     ROOT_DIR = "/home/bojan/probe_data/bern8"
-    LOCAL_SINGLE_THREAD_DEBUG_MODE = True
-    ANRISS0005_FLAG = None
+    LOCAL_SINGLE_THREAD_DEBUG_MODE = False
+    ANRISS0005_FLAG = True
     if LOCAL_SINGLE_THREAD_DEBUG_MODE:
         ROOT_DIR = "/home/bojan/probe_data/local_debug"
     total_start = time.perf_counter()
@@ -535,26 +540,7 @@ if __name__ == "__main__":
             'tau0': [500, 1500],
         }
         # (batch id [(location id, x, y)])
-        test_location_area = (0, [(0, 2630808, 1184548)]) 
-        test_location_area = (0, [(0, 2608198, 1145230, 25)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 50)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 100)]) # Anriss0005 from all performance tests
         test_location_area = (0, [(0, 2608198, 1145230, 200)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 250)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 300)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 400)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 500)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 600)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 700)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 800)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 900)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 1000)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 1500)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 40)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 30)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 25)]) # Anriss0005 from all performance tests
-        test_location_area = (0, [(0, 2608198, 1145230, 900)]) # Anriss0005 from all performance tests
-    
     
         debug_worker = WorkerClass(BE_DEM_5M, CONFIG_TEMPLATE, ROOT_DIR, manual_override_params_sorted)
         results = debug_worker.process_batch(test_location_area)
