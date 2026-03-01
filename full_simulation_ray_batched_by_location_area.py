@@ -60,7 +60,7 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
         X = 2608198
         Y = 1145230
         area = 300
-        print(f"🎯 Anriss0005Flag active: Yielding {max_locations} copies of the same test location ({X}, {Y}, {area})")
+        print(f"🎯 Anriss0005Flag active: Yielding {max_locations} (near-)copies of the same test location ({X}, {Y}, {area})")
         # Provide the same (batch_id, batch) structure as normal operation
 
         if max_locations is not None:
@@ -72,13 +72,21 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
     
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
+    SEED=1
     query = f"""
         SELECT 
-            id, 
-            CAST(ST_X(geom) AS INTEGER) as x, 
-            CAST(ST_Y(geom) AS INTEGER) as y 
-        FROM st_read('{gpkg_path}', layer='samples')
-    """
+            l.id, 
+            CAST(ST_X(l.geom) AS INTEGER) as x, 
+            CAST(ST_Y(l.geom) AS INTEGER) as y,
+            a.area
+        FROM 
+            st_read('{gpkg_path}', layer='samples') l
+        CROSS JOIN 
+            (SELECT UNNEST(ARRAY[100, 200, 500, 1000]) AS area) a
+        ORDER BY 
+            -- Creates a deterministic "random" order
+            HASH(l.id::VARCHAR || a.area::VARCHAR || '{SEED}')
+        """
     if max_locations is not None:
         query += f" LIMIT {max_locations}"
 
@@ -487,7 +495,7 @@ if __name__ == "__main__":
     # ===========================================================================================================
     ROOT_DIR = "/home/bojan/probe_data/bern8"
     LOCAL_SINGLE_THREAD_DEBUG_MODE = False
-    ANRISS0005_FLAG = True
+    ANRISS0005_FLAG = None
     if LOCAL_SINGLE_THREAD_DEBUG_MODE:
         ROOT_DIR = "/home/bojan/probe_data/local_debug"
     total_start = time.perf_counter()
@@ -498,8 +506,8 @@ if __name__ == "__main__":
     RAY_MODE = "local_cluster"
     N_RAY_WORKERS = 8
     MAX_IN_FLIGHT = N_RAY_WORKERS * 2  # queue one task for every worker
-    N_LIMIT_LOCATIONS = 8
-    N_LOCATIONS_IN_BATCH = 1
+    N_LIMIT_LOCATIONS = 24
+    N_LOCATIONS_AREAS_IN_BATCH = 3
     
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -587,7 +595,7 @@ if __name__ == "__main__":
     # Prepare INPUT for simulation by setting up the DuckDB batch generator (batch = locations (X/Y))
     # TODO read from S3
     # TODO set total n locations in case N_LIMIT_LOCATIONS is not set
-    batch_generator = get_location_batches(LOCATIONS, batch_size=N_LOCATIONS_IN_BATCH , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=ANRISS0005_FLAG)
+    batch_generator = get_location_batches(LOCATIONS, batch_size=N_LOCATIONS_AREAS_IN_BATCH , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=ANRISS0005_FLAG)
     # dry run: get the first 10 entries of the batch generator and print them
     print(f"Running dry run: showing first 10 batches")
     for i in range(10):
@@ -603,7 +611,7 @@ if __name__ == "__main__":
         pprint.pprint(batch)
     # real run
     print(f"Now starting real run")
-    batch_generator = get_location_batches(LOCATIONS, batch_size=N_LOCATIONS_IN_BATCH , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=ANRISS0005_FLAG)
+    batch_generator = get_location_batches(LOCATIONS, batch_size=N_LOCATIONS_AREAS_IN_BATCH , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=ANRISS0005_FLAG)
     
     # 1. SEND: Use map_unordered to distribute the generator across the 8 actors
     # This automatically maintains backpressure and keeps all 8 actors busy.
