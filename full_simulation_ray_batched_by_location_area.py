@@ -57,14 +57,17 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
     # --- OVERRIDE LOGIC ---
     if anriss0005_flag:
         # The structure is a list of tuples: [(id, x, y, area)]
-        print(f"🎯 Anriss0005Flag active: Yielding {max_locations} copies of the same test location (2608198, 1145230, 200)")
+        X = 2608198
+        Y = 1145230
+        area = 300
+        print(f"🎯 Anriss0005Flag active: Yielding {max_locations} copies of the same test location ({X}, {Y}, {area})")
         # Provide the same (batch_id, batch) structure as normal operation
 
         if max_locations is not None:
-            for _ in range(max_locations):
-                yield (0, [(0, 2608198, 1145230, 200)]) # Anriss0005 from all performance tests
+            for i in range(max_locations):
+                yield (0, [(0, X, Y, area+i)]) # i adds one small meter just to ensure that the various workers read from different files (no I/O clash)
         else:
-            yield (0, [(0, 2608198, 1145230, 200)]) # Anriss0005 from all performance tests
+            yield (0, [(0, X, Y, area)]) # Anriss0005 from all performance tests
         return # Stop the generator here
     
     con = duckdb.connect()
@@ -624,4 +627,6 @@ if __name__ == "__main__":
                 print(f"⚠️ Error bresult batch: {e}")
 
     total_dur = time.perf_counter() - total_start
+    print("=======================================================================")
     print(f"✅ Processing all complete. Total run time: {total_dur:.2f}s ⏱️")
+    print("=======================================================================")
