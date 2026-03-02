@@ -11,7 +11,7 @@ NUM_LOCATIONS = 32
 SIMULATION_DATA_ROOT_DIR = Path(f"/home/bojan/probe_data/bern{NUM_LOCATIONS}")
 SWISSBOUNDARIES_GDB = "/home/bojan/probe_pre_processing/data/swissboundaries/swissBOUNDARIES3D_1_5_LV95_LN02.gdb"
 SIMULATION_DATA_ROOT_DIR.mkdir(parents=True, exist_ok=True)
-AREA_SEQUENCE = [100, 100, 100, 200, 200, 200, 500, 500, 1000]
+AREA_SEQUENCE = [100, 100, 200, 300, 300, 500, 800, 1000]
 
 # Output File Paths
 parquet_manifest = SIMULATION_DATA_ROOT_DIR / "event_manifest.parquet"
@@ -43,7 +43,7 @@ for i, (x, y) in enumerate(locations):
     # Get the next area from the cycled list
     area = next(area_pool)
     data_rows.append({
-        'loc_id': i,
+        'event_id': i,
         'x': x,
         'y': y,
         'area': area
@@ -64,4 +64,4 @@ gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:2056")
 gdf['geometry'] = gdf.geometry.buffer(gdf['area'].apply(lambda a: (a/3.14159)**0.5))
 gdf.to_file(spatial_gpkg, driver="GPKG", layer="simulation_points")
 
-print(f"✅ Completed. Generated {len(df)} total events (location * area).")
+print(f"✅ Done. Generated {len(df)} total events (location * area).")
