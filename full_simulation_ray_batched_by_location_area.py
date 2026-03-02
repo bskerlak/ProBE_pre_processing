@@ -10,6 +10,7 @@ import geopandas as gpd
 from shapely.geometry import Point
 import rasterio
 from rasterio.warp import reproject, Resampling
+from rasterio.windows import from_bounds
 
 # orchestration
 import duckdb
@@ -46,14 +47,10 @@ NOISY_LOGGERS = [
 ]
 os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
 
-def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0005_flag=None):
+def get_event_batches(event_manifest_path, batch_size=1000, max_locations=None, anriss0005_flag=False):
     """
-    Gets location batches from the location file
-    
-    :param gpkg_path: Description
-    :param batch_size: Description
+    Gets event (X, Y, area) batches from the event manifest file
     """
-
     # --- OVERRIDE LOGIC ---
     if anriss0005_flag:
         # The structure is a list of tuples: [(id, x, y, area)]
@@ -71,43 +68,27 @@ def get_location_batches(gpkg_path, batch_size=1000, max_locations=None, anriss0
         return # Stop the generator here
     
     con = duckdb.connect()
-    con.execute("INSTALL spatial; LOAD spatial;")
-    SEED=1
-    query = f"""
-        SELECT 
-            l.id, 
-            CAST(ST_X(l.geom) AS INTEGER) as x, 
-            CAST(ST_Y(l.geom) AS INTEGER) as y,
-            a.area
-        FROM 
-            st_read('{gpkg_path}', layer='samples') l
-        CROSS JOIN 
-            (SELECT UNNEST(ARRAY[100, 200, 500, 1000]) AS area) a
-        ORDER BY 
-            -- Creates a deterministic "random" order
-            HASH(l.id::VARCHAR || a.area::VARCHAR || '{SEED}')
-        """
+    query = f"SELECT * FROM '{event_manifest_path}'"
     if max_locations is not None:
         query += f" LIMIT {max_locations}"
-
     cursor = con.execute(query)
     
-    batch_id = 0
+    batch_id = 1
     while True:
-        batch = cursor.fetchmany(batch_size)
-        if not batch:
+        event = cursor.fetchmany(batch_size)
+        if not event:
             break
         pass
-        yield (batch_id, batch)
+        yield (batch_id, event)
         batch_id += 1
 
 def save_batch_to_csv(rows, logfile_path):
     """Append simulation log rows to `logfile_path` as CSV.
 
-    Each row should be: [batch_id, loc_idx, x, y, area, relTh, mu, xsi, tau0, duration, status, message]
+    Each row should be: [batch_id, event_idx, x, y, area, relTh, mu, xsi, tau0, duration, status, message]
     """
     logfile_path = Path(logfile_path)
-    header = ['batch_id', 'loc_idx', 'x', 'y', 'area', 'relTh', 'mu', 'xsi', 'tau0', 'duration', 'status', 'message']
+    header = ['batch_id', 'event_idx', 'x', 'y', 'area', 'relTh', 'mu', 'xsi', 'tau0', 'duration', 'status', 'message']
     write_header = not logfile_path.exists()
     logfile_path.parent.mkdir(parents=True, exist_ok=True)
     with open(logfile_path, 'a', newline='') as fh:
@@ -223,8 +204,6 @@ class AvaFrameAnrissManager:
     """
     Prepares Input for AvaFrame
     Extracts DEM into ASCII format used by AvaFrame
-    
-
     :param master_dem_path: 5m DEM for Kanton Bern
     :param config_template_path: AvaFrame Config template
     :param root_dir: Root directory for the current simulation    
@@ -265,7 +244,7 @@ class AvaFrameAnrissManager:
         if out_path.with_suffix('.prj').exists():
             out_path.with_suffix('.prj').unlink()
 
-    def get_flow_bounds(self, result_ascii, safety_buffer=10):
+    def get_flow_extent_with_safety_buffer_from_result_ascii(self, result_ascii, safety_buffer=10):
         # setting default buffer to 10m is a bit arbitrary, just want to avoid problems with boundary pixels
         with rasterio.open(result_ascii) as src:
             data = src.read(1)
@@ -275,13 +254,12 @@ class AvaFrameAnrissManager:
             res = src.res[0]
             return [min(xs) - safety_buffer, max(xs) + res + safety_buffer, min(ys) - safety_buffer, max(ys) + safety_buffer]
 
-    def run_lead_sim(self, x, y, area):
+    def run_lead_sim_get_right_extent_with_safety_buffer(self, x, y, area):
         start_tc = time.perf_counter()
         print(f"🚀 Running lead simulation for (X, Y, area) = ({x}, {y}, {area})")
         p = self.worst_case_parameters
         sim_path = self.simulation_base_path / f"Sim_X{x}_Y{y}_A{area}_relTh{p['relTh']}_mu{p['mu']}_xsi{p['xsi']}_tau0{p['tau0']}"
         input_dir = self.setup_dirs(sim_path)
-        
         shutil.copy(self.config_template_path, input_dir / "CONFIG" / "cfgCom1DFA.ini")
         
         # set initial buffer (here we start the search from)
@@ -324,7 +302,7 @@ class AvaFrameAnrissManager:
                 print(f"Increased buffer by {buffer_delta}m to +-{buffer}m")
 
         matches = list((sim_path / "Outputs" / "com1DFA" / "peakFiles").glob("*_pft.asc"))
-        tight_extent = self.get_flow_bounds(matches[0])
+        tight_extent = self.get_flow_extent_with_safety_buffer_from_result_ascii(matches[0])
         lead_duration = time.perf_counter() - start_tc
         print(f"✂️✅ Lead Sim completed in {lead_duration:.2f}s. Tight Extent calculated. Needed buffer: +-{buffer}m")
         return [int(np.round(v // 5 * 5)) for v in tight_extent], buffer
@@ -357,15 +335,13 @@ class AvaFrameAnrissManager:
                 buffer = 0
             except Exception as e:
                 print(f"Error when opening DEM {dem_path}: {e}")
-            return dem_path, extent, buffer
+        else:
+            # DEM is not available in cache: run a lead sim to compute tight extent and create the DEM
+            dem_path.parent.mkdir(parents=True, exist_ok=True)
+            extent, buffer = self.run_lead_sim_get_right_extent_with_safety_buffer(x, y, area)
+            self.extract_ascii_raster_from_master_dem(dem_path, extent)
 
-        # ----------------------------------------------------------------------------------------
-        # DEM is not available in cache: run a lead sim to compute tight extent and create the DEM
-        dem_path.parent.mkdir(parents=True, exist_ok=True)
-        extent, buffer = self.run_lead_sim(x, y, area)
-        self.extract_ascii_raster_from_master_dem(dem_path, extent)
         return dem_path, extent, buffer
-        # ----------------------------------------------------------------------------------------
 
 class AvaFrameBatchWorker:
     def __init__(self, dem_path, config_template, root_dir, parameters):
@@ -378,14 +354,14 @@ class AvaFrameBatchWorker:
 
         for logger_name in NOISY_LOGGERS:
             l = logging.getLogger(logger_name)
-            l.setLevel(logging.WARNING) # Only show errors or warnings
-            l.propagate = False         # Prevent them from sending logs up to your s
+            l.setLevel(logging.WARNING)
+            l.propagate = False
 
     def process_batch(self, batch_data, overwrite=False):
         """ 
         Batch = (batch_id, collection of locations and areas (x, y, area)) 
         """
-        batch_id, x_y_area = batch_data
+        batch_id, events_in_batch = batch_data
         batch_start = time.perf_counter()
 
         # Create a unique directory for this batch
@@ -393,9 +369,9 @@ class AvaFrameBatchWorker:
         batch_output_path = self.simulation_base_path / batch_dir_name
         batch_output_path.mkdir(parents=True, exist_ok=True)
 
-        print(f"📦 Processing {batch_dir_name} ({len(x_y_area)} locations x area combinations)")
-        # check if batch already processes
-        def batch_already_processed(batch_output_path):
+        print(f"📦 Processing {batch_dir_name} ({len(events_in_batch)} events (location x area))")
+
+        def _batch_already_processed(batch_output_path):
             data_lake_silver_path = Path(batch_output_path) / "batch_data_lake_silver" / "batch_merged_silver.parquet"
             data_lake_silver_present = data_lake_silver_path.exists()
             data_lake_bronze_path = Path(batch_output_path) / "batch_data_lake_bronze"
@@ -406,7 +382,7 @@ class AvaFrameBatchWorker:
             else:
                 return False
 
-        if batch_already_processed(batch_output_path) and not overwrite:
+        if _batch_already_processed(batch_output_path) and not overwrite:
             log_list = []
             log_list.append([batch_id, -999, -999, -999, -999, -999, -999, -999, -999, -999, "SKIPPED_BATCH", "silver data lake already present, overwrite = False"])
             return log_list
@@ -414,28 +390,28 @@ class AvaFrameBatchWorker:
             pass  # overwrite batch
 
         results = []
-        for location_area in x_y_area:
+        for event_data in events_in_batch:
             # Pass the batch_dir_name and numeric batch_id down to process_location
-            results.extend(self.process_location_area(location_area, batch_dir_name, batch_id))
+            results.extend(self.process_event_in_batch(event_data, batch_dir_name, batch_id))
         batch_duration = time.perf_counter() - batch_start
-        print(f"📦 Batch ID {batch_id} in dir {batch_dir_name} ({len(x_y_area)} locations) processed in {batch_duration:.2f}s")
+        print(f"📦 Batch ID {batch_id} in dir {batch_dir_name} ({len(events_in_batch)} locations) processed in {batch_duration:.2f}s")
         return results
     
-    def process_location_area(self, location_area_data, batch_dir_name, batch_id):
-        loc_idx, x, y, area = location_area_data
+    def process_event_in_batch(self, event_data, batch_dir_name, batch_id):
+        event_idx, x, y, area = event_data
         log_list, successful_sim_paths = [], []
         loc_start = time.perf_counter()
-        print(f"📍 Start location idx {loc_idx}, (X, Y, area) = ({x}, {y}, {area})")
+        print(f"📍 Start Event (event_idx, X, Y, area) = ({event_idx}, {x}, {y}, {area})")
         try:          
-            # 1. Get DEM for this location
+            # 1. Get DEM for this event
             self.anriss_manager.simulation_base_path = self.simulation_base_path / batch_dir_name # add batch name to anriss manager so the lead simulation gets stored in the right batch
             DEM_worst_case_simulation_path, worst_case_simulation_extent, buffer = self.anriss_manager.get_DEM_for_location_area(x, y, area)
             self.anriss_manager.extract_ascii_raster_from_master_dem(DEM_worst_case_simulation_path, worst_case_simulation_extent)
 
             # 2. Parameter Grid
             keys = self.parameters.keys()
-            # TODO extend with modifications / rules defined by AWN / TP Modellierung (instead of simple grid)
             parameter_combinations = [dict(zip(keys, v)) for v in itertools.product(*self.parameters.values())]
+            # TODO extend with modifications / rules defined by AWN / TP Modellierung (instead of simple grid)
             print(f"   Parameter grid: {len(parameter_combinations)} combinations. First 5: {parameter_combinations[:5]}")
 
             for parameter_combination in parameter_combinations:
@@ -447,11 +423,14 @@ class AvaFrameBatchWorker:
                 if parameter_combination != self.worst_case_params or True:
                     try:
                         input_dir = self.anriss_manager.setup_dirs(sim_path)
+                        # get DEM into this sim dir
                         shutil.copy2(DEM_worst_case_simulation_path, input_dir / "dem.asc")
+                        # setup release area (circle from center and radius)
                         radius = math.sqrt(area / math.pi)
                         circle = Point(x, y).buffer(radius, quad_segs=16)
                         rel_path = input_dir / "REL" / "rel.shp"
                         gpd.GeoDataFrame([{'geometry': circle, 'id': 'rel_0'}], crs="EPSG:2056").to_file(rel_path)
+                        # setup config for this specific parameter combination
                         cfg = configparser.ConfigParser(); cfg.optionxform = str
                         cfg.read(self.anriss_manager.config_template_path)
                         for k, v in [('muvoellmyminshear', p['mu']), ('xsivoellmyminshear', p['xsi']), 
@@ -464,27 +443,27 @@ class AvaFrameBatchWorker:
                         # ------------------------------------------------------------------------------------------------
                         sim_dur = time.perf_counter() - sim_start
                         print(f"   ✅ Sim finished for area={area} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} in {sim_dur:.2f}s")
-                        log_list.append([batch_id, loc_idx, x, y, area, p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS", ""])
+                        log_list.append([batch_id, event_idx, x, y, area, p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS", ""])
 
                     except Exception as e:
                         sim_dur = time.perf_counter() - sim_start
                         print(f"   ❌ Sim failed for area={area} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} after {sim_dur:.2f}s: {e}")
-                        log_list.append([batch_id, loc_idx, x, y, area, p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "FAIL", str(e)])
+                        log_list.append([batch_id, event_idx, x, y, area, p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "FAIL", str(e)])
                 else:
                     pass 
                     # TODO implement this logic if needed (probably not worth the effort)
                     sim_dur = time.perf_counter() - sim_start
                     print(f"   🔁 Skipped worst-case sim (✅ lead simulation already calculated) for area={area} relTh={p['relTh']} mu={p['mu']} xsi={p['xsi']} tau0={p['tau0']} ({sim_dur:.2f}s)")
-                    log_list.append([batch_id, loc_idx, x, y, area, p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS_LEAD", ""])
+                    log_list.append([batch_id, event_idx, x, y, area, p['relTh'], p['mu'], p['xsi'], p['tau0'], sim_dur, "SUCCESS_LEAD", ""])
                 
                 successful_sim_paths.append(sim_path)
 
             loc_dur = time.perf_counter() - loc_start
-            print(f"📍 Simulations for location idx={loc_idx} (x,y)=({x},{y}) completed in {loc_dur:.2f}s")
+            print(f"📍 Simulations for Event (event_idx, x, y, area)=({event_idx}, {x}, {y}, {area}) completed in {loc_dur:.2f}s")
 
         except Exception as e:
             # duration unknown for critical errors - record as 0
-            log_list.append([batch_id, loc_idx, x, y, 0, 0, 0, 0, 0, 0, "CRITICAL_ERROR", str(e)])
+            log_list.append([batch_id, event_idx, x, y, 0, 0, 0, 0, 0, 0, "CRITICAL_ERROR", str(e)])
             raise
         return log_list
     
@@ -493,22 +472,27 @@ if __name__ == "__main__":
     # ===========================================================================================================
     # 0) CONFIG
     # ===========================================================================================================
-    ROOT_DIR = "/home/bojan/probe_data/bern8"
+    
+    ROOT_DIR = "/home/bojan/probe_data/bern32"
+    # debug mode
     LOCAL_SINGLE_THREAD_DEBUG_MODE = False
-    ANRISS0005_FLAG = None
+    ANRISS0005_FLAG = False
     if LOCAL_SINGLE_THREAD_DEBUG_MODE:
         ROOT_DIR = "/home/bojan/probe_data/local_debug"
-    total_start = time.perf_counter()
+    # inputs
     BE_DEM_5M = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned_5km_buffer_COG_cropped.tif"
     CONFIG_TEMPLATE = "/home/bojan/probe_pre_processing/cfgCom1DFA_template.ini"
-    LOCATIONS = "/home/bojan/probe_data/bern/locations_random_1000.gpkg"
-    LOG_FILE = Path(ROOT_DIR) / f"log_started_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    EVENT_MANIFEST = "/home/bojan/probe_data/bern32/event_manifest.parquet"
+    
+    # ray
     RAY_MODE = "local_cluster"
     N_RAY_WORKERS = 8
     MAX_IN_FLIGHT = N_RAY_WORKERS * 2  # queue one task for every worker
-    N_LIMIT_LOCATIONS = 24
-    N_LOCATIONS_AREAS_IN_BATCH = 3
+    N_EVENTS_LIMIT = 8
+    N_EVENTS_IN_BATCH = 4
     
+    # logging
+    LOG_FILE = Path(ROOT_DIR) / f"log_started_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     handler = logging.StreamHandler(sys.stdout)
@@ -521,6 +505,7 @@ if __name__ == "__main__":
     # 1) PREPARE SIMULATION
     # ===========================================================================================================
 
+    total_start = time.perf_counter()
     # Simulation parameters
     raw_params = {
         'relTh': [0.75, 1, 3],
@@ -551,10 +536,10 @@ if __name__ == "__main__":
             'tau0': [500, 1500],
         }
         # (batch id [(location id, x, y)])
-        test_location_area = (0, [(0, 2608198, 1145230, 200)]) # Anriss0005 from all performance tests
+        test_event = (0, [(0, 2608198, 1145230, 200)]) # Anriss0005 from all performance tests
     
         debug_worker = WorkerClass(BE_DEM_5M, CONFIG_TEMPLATE, ROOT_DIR, manual_override_params_sorted)
-        results = debug_worker.process_batch(test_location_area)
+        results = debug_worker.process_batch(test_event)
         try:
             written = save_batch_to_csv(results, LOG_FILE)
             print(f"✅ Wrote debug log to {LOG_FILE} ({written} rows)")
@@ -567,7 +552,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # ===========================================================================================================
-    # 3) INITIALIZE RAY CLUSTER
+    # 3) INITIALIZE RAY CLUSTER AND WORKER POOL
     # ==========================================================================================================
     print("Initializing Ray Cluster...")
     if not ray.is_initialized():
@@ -582,7 +567,6 @@ if __name__ == "__main__":
         # wrapping to enable both local debug without decorator and remote with decorator
         return WorkerClass.remote(*args, **kwargs)
 
-    # N_RAY_WORKERS = int(ray.available_resources().get("CPU", 4))
     print(f"Setting up {N_RAY_WORKERS} Ray Workers ...")
     WorkerClass = ray.remote(num_cpus=1)(AvaFrameBatchWorker)
     workers = [create_worker(BE_DEM_5M, CONFIG_TEMPLATE, ROOT_DIR, sorted_params) for i in range(N_RAY_WORKERS)]
@@ -595,7 +579,7 @@ if __name__ == "__main__":
     # Prepare INPUT for simulation by setting up the DuckDB batch generator (batch = locations (X/Y))
     # TODO read from S3
     # TODO set total n locations in case N_LIMIT_LOCATIONS is not set
-    batch_generator = get_location_batches(LOCATIONS, batch_size=N_LOCATIONS_AREAS_IN_BATCH , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=ANRISS0005_FLAG)
+    batch_generator = get_event_batches(EVENT_MANIFEST, batch_size=N_EVENTS_IN_BATCH , max_locations=N_EVENTS_LIMIT, anriss0005_flag=ANRISS0005_FLAG)
     # dry run: get the first 10 entries of the batch generator and print them
     print(f"Running dry run: showing first 10 batches")
     for i in range(10):
@@ -607,20 +591,20 @@ if __name__ == "__main__":
         except Exception as e:
             print('NEXT_ERROR', e)
             break
-        print(f'--- Batch {i+1} (len={len(batch)}) ---')
+        print(f'--- Batch {i+1} (n_events={N_EVENTS_IN_BATCH}) ---')
         pprint.pprint(batch)
     # real run
     print(f"Now starting real run")
-    batch_generator = get_location_batches(LOCATIONS, batch_size=N_LOCATIONS_AREAS_IN_BATCH , max_locations=N_LIMIT_LOCATIONS, anriss0005_flag=ANRISS0005_FLAG)
+    batch_generator = get_event_batches(EVENT_MANIFEST, batch_size=N_EVENTS_IN_BATCH , max_locations=N_EVENTS_LIMIT, anriss0005_flag=ANRISS0005_FLAG)
     
     # 1. SEND: Use map_unordered to distribute the generator across the 8 actors
     # This automatically maintains backpressure and keeps all 8 actors busy.
-    # The 'job_data' here is now the (batch_id, batch_list) tuple
+    # The 'job_data' here is now the (batch_id, [(X1, Y1, area1), (X2, Y2, area2), ...]) tuple
     result_generator = pool.map_unordered(
        lambda worker, job_data: worker.process_batch.remote(job_data), batch_generator
     )
 
-    with tqdm(desc="Simulation", unit=" simulations", total=N_LIMIT_LOCATIONS) as pbar:
+    with tqdm(desc="Simulation", unit=" simulations", total=N_EVENTS_LIMIT) as pbar:
         # 2. COLLECT: Iterate directly over the result generator
         # This loop only advances when an actor finishes a batch
         for batch_results in result_generator:
