@@ -56,7 +56,7 @@ def get_event_batches(event_manifest_path, batch_size=1000, max_locations=None, 
         # The structure is a list of tuples: [(id, x, y, area)]
         X = 2608198
         Y = 1145230
-        area = 300
+        area = 200
         print(f"🎯 Anriss0005Flag active: Yielding {max_locations} (near-)copies of the same test location ({X}, {Y}, {area})")
         # Provide the same (batch_id, batch) structure as normal operation
 
@@ -459,7 +459,7 @@ class AvaFrameBatchWorker:
                 successful_sim_paths.append(sim_path)
 
             loc_dur = time.perf_counter() - loc_start
-            print(f"📍 Simulations for Event (event_idx, x, y, area)=({event_idx}, {x}, {y}, {area}) completed in {loc_dur:.2f}s")
+            print(f"📍✅ Simulations for Event (event_idx, x, y, area)=({event_idx}, {x}, {y}, {area}) completed in {loc_dur:.2f}s")
 
         except Exception as e:
             # duration unknown for critical errors - record as 0
@@ -476,7 +476,7 @@ if __name__ == "__main__":
     ROOT_DIR = "/home/bojan/probe_data/bern32"
     # debug mode
     LOCAL_SINGLE_THREAD_DEBUG_MODE = False
-    ANRISS0005_FLAG = False
+    ANRISS0005_FLAG = True
     if LOCAL_SINGLE_THREAD_DEBUG_MODE:
         ROOT_DIR = "/home/bojan/probe_data/local_debug"
     # inputs
@@ -486,7 +486,7 @@ if __name__ == "__main__":
     
     # ray
     RAY_MODE = "local_cluster"
-    N_RAY_WORKERS = 8
+    N_RAY_WORKERS = 2
     MAX_IN_FLIGHT = N_RAY_WORKERS * 2  # queue one task for every worker
     N_EVENTS_LIMIT = 8
     N_EVENTS_IN_BATCH = 4
