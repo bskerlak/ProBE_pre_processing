@@ -25,7 +25,7 @@ import configparser
 import csv
 import logging
 import time
-import pprint
+from pprint import pprint
 from pathlib import Path
 from datetime import datetime
 
@@ -46,6 +46,45 @@ NOISY_LOGGERS = [
     "pyogrio._io"
 ]
 os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
+
+def print_cluster_status():
+    """Prints a human-readable summary of the Ray cluster."""
+    if not ray.is_initialized():
+        print("❌ Ray is not initialized.")
+        return
+
+    resources = ray.cluster_resources()
+    nodes = ray.nodes()
+    
+    # 1. Hardware Stats
+    total_cpus = resources.get("CPU", 0)
+    # Memory is in bytes, convert to GB
+    total_mem_gb = resources.get("memory", 0) / (1024**3)
+    obj_store_gb = resources.get("object_store_memory", 0) / (1024**3)
+
+    # 2. Node Stats
+    alive_nodes = [n for n in nodes if n["Alive"]]
+    head_node_ip = next((n["NodeManagerAddress"] for n in nodes if n.get("Resources", {}).get("node:__internal_head__")), "Unknown")
+
+    print("="*40)
+    print("🌐 RAY CLUSTER STATUS REPORT")
+    print("="*40)
+    print(f"📍 Head Node IP:    {head_node_ip}")
+    print(f"👥 Active Nodes:    {len(alive_nodes)}")
+    print("-"*40)
+    print(f"⚡ Total CPUs:      {total_cpus:.0f} cores")
+    print(f"🧠 System Memory:   {total_mem_gb:.2f} GB")
+    print(f"📦 Object Store:    {obj_store_gb:.2f} GB")
+    print("-"*40)
+    
+    # List individual nodes
+    print("Nodes in Cluster:")
+    for node in alive_nodes:
+        ip = node["NodeManagerAddress"]
+        node_cpus = node["Resources"].get("CPU", 0)
+        role = "[HEAD]" if ip == head_node_ip else "[WORKER]"
+        print(f"  {role} {ip} ({node_cpus:.0f} cores)")
+    print("="*40)
 
 def get_event_batches(event_manifest_path, batch_size=1000, max_locations=None, anriss0005_flag=False):
     """
@@ -485,11 +524,11 @@ if __name__ == "__main__":
     EVENT_MANIFEST = "/home/bojan/probe_data/bern32/event_manifest.parquet"
     
     # ray
-    RAY_MODE = "local_cluster"
-    N_RAY_WORKERS = 2
+    RAY_MODE = "hosttech"
+    N_RAY_WORKERS = 7
     MAX_IN_FLIGHT = N_RAY_WORKERS * 2  # queue one task for every worker
-    N_EVENTS_LIMIT = 8
-    N_EVENTS_IN_BATCH = 4
+    N_EVENTS_LIMIT = 7
+    N_EVENTS_IN_BATCH = 1
     
     # logging
     LOG_FILE = Path(ROOT_DIR) / f"log_started_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
@@ -560,8 +599,13 @@ if __name__ == "__main__":
             ray.init(local_mode=True)
         elif RAY_MODE == "local_cluster":
             ray.init()
+        elif RAY_MODE == "hosttech":
+            ray.init(address="ray://localhost:10001")
+            print("🚀 Connected to Hosttech Cluster!")
         else:
             ray.init()
+    
+    print_cluster_status()
 
     def create_worker(*args, **kwargs):
         # wrapping to enable both local debug without decorator and remote with decorator
@@ -592,7 +636,7 @@ if __name__ == "__main__":
             print('NEXT_ERROR', e)
             break
         print(f'--- Batch {i+1} (n_events={N_EVENTS_IN_BATCH}) ---')
-        pprint.pprint(batch)
+        pprint(batch)
     # real run
     print(f"Now starting real run")
     batch_generator = get_event_batches(EVENT_MANIFEST, batch_size=N_EVENTS_IN_BATCH , max_locations=N_EVENTS_LIMIT, anriss0005_flag=ANRISS0005_FLAG)
