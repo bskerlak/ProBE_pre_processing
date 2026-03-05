@@ -30,15 +30,20 @@ def get_bern_extent(
 
     return bern.crs, (minx, miny, maxx, maxy)
 
-def get_bern_buffered(
+def get_bern_buffered(cutline_path,
     swissboundaries_gdb="/home/bojan/probe_pre_processing/data/swissboundaries/swissBOUNDARIES3D_1_5_LV95_LN02.gdb",
     layer="TLM_KANTONSGEBIET",
-    buffer_meters: float = 5000.0
+    buffer_meters: float = 5000.0,
 ):
     """Returns the Kanton Bern geometry buffered by buffer_meters."""
-    gdf = gpd.read_file(swissboundaries_gdb, layer=layer)
-    bern = gdf.loc[gdf.NAME == "Bern"].copy()
-    bern["geometry"] = bern.geometry.buffer(buffer_meters)
+    try:
+        gdf = gpd.read_file(cutline_path)
+        bern = gdf
+    except FileNotFoundError:
+        gdf = gpd.read_file(swissboundaries_gdb, layer=layer)
+        bern = gdf.loc[gdf.NAME == "Bern"].copy()
+        bern["geometry"] = bern.geometry.buffer(buffer_meters)
+        bern.to_file(cutline_path, driver="GPKG")
     return bern
 
 def download_tiles(csv_path, out_dir="/home/bojan/probe_pre_processing/data/bern_2m_tiles"):
@@ -131,11 +136,10 @@ if __name__ == "__main__":
         print(f"✂️  Cropping {OUTPUT_TIF} to Kanton Bern polygon (+5km buffer)...")
         
         # 1. Get buffered polygon
-        bern_buffered = get_bern_buffered()
+        cutline_path = Path(OUTPUT_TIF).parent / "kanton_bern_5km_buffer_geometry.gpkg"
+        bern_buffered = get_bern_buffered(cutline_path)
         
         # 2. Save cutline to temporary file
-        cutline_path = Path(OUTPUT_TIF).parent / "kanton_bern_5km_buffer_geometry.gpkg"
-        bern_buffered.to_file(cutline_path, driver="GPKG")
         
         # 3. Warp with cutline
         cmd = [
