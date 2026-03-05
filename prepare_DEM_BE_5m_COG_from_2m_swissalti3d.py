@@ -134,7 +134,7 @@ if __name__ == "__main__":
         bern_buffered = get_bern_buffered()
         
         # 2. Save cutline to temporary file
-        cutline_path = Path(OUTPUT_TIF).parent / "cutline_bern.gpkg"
+        cutline_path = Path(OUTPUT_TIF).parent / "kanton_bern_5km_buffer_geometry.gpkg"
         bern_buffered.to_file(cutline_path, driver="GPKG")
         
         # 3. Warp with cutline
