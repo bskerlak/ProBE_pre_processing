@@ -10,3 +10,4 @@ data/swissboundaries
 *.prj
 data/simulation_inputs
 *.tmp
+*.gpkg

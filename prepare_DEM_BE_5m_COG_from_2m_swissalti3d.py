@@ -119,7 +119,7 @@ if __name__ == "__main__":
     if DOWNLOAD:
         download_tiles(CSV_PATH, out_dir=TILES_DIR)
 
-    PROCESS = False
+    PROCESS = True
     if PROCESS:
         crs, extent = get_bern_extent()
         print(f"📍 Buffered Extent (LV95): {extent}")
