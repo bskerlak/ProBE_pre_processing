@@ -11,3 +11,4 @@ data/swissboundaries
 data/simulation_inputs
 *.tmp
 *.gpkg
+*.txt

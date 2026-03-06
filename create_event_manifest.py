@@ -7,15 +7,16 @@ from shapely.prepared import prep
 from itertools import cycle # For cycling through the area list
 
 # --- CONFIGURATION ---
-NUM_LOCATIONS = 32
+NUM_LOCATIONS = 128
 SIMULATION_DATA_ROOT_DIR = Path(f"/home/bojan/probe_data/bern{NUM_LOCATIONS}")
+CONTROL_CENTER_ROOT_DIR = Path(f"/home/bojan/probe_control_center")
 SWISSBOUNDARIES_GDB = "/home/bojan/probe_pre_processing/data/swissboundaries/swissBOUNDARIES3D_1_5_LV95_LN02.gdb"
 SIMULATION_DATA_ROOT_DIR.mkdir(parents=True, exist_ok=True)
 AREA_SEQUENCE = [100, 100, 200, 300, 300, 500, 800, 1000]
 
 # Output File Paths
-parquet_manifest = SIMULATION_DATA_ROOT_DIR / "event_manifest.parquet"
-spatial_gpkg = SIMULATION_DATA_ROOT_DIR / "event_manifest_visualization.gpkg"
+parquet_manifest = CONTROL_CENTER_ROOT_DIR / "input" / f"bern{NUM_LOCATIONS}_event_manifest.parquet"
+spatial_gpkg = CONTROL_CENTER_ROOT_DIR / "input" / f"bern{NUM_LOCATIONS}_event_manifest_visualization.gpkg"
 
 print(f"🎲 Generating {NUM_LOCATIONS} random locations in Kanton Bern...")
 
