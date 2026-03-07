@@ -65,4 +65,4 @@ for area in [25, 70, 130, 250, 400, 700, 1100]:
 
     filename_out = CONTROL_CENTER_ROOT_DIR / "input" / f"MINI{NUM_LOCATIONS}_sensitivität_area{area}_event_manifest.parquet"
     print(f"💾 Saving MINI Teil b) Sensitivität - area {area}m2 - Parquet manifest ({n_remaining} rows): {filename_out}")
-    mini_events.to_parquet(filename_out, index=False)
+    df_filtered.to_parquet(filename_out, index=False)   
