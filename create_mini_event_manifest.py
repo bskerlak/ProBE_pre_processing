@@ -1,10 +1,8 @@
 import geopandas as gpd
 import numpy as np
-import pandas as pd
 from pathlib import Path
-from shapely.geometry import Point
-from shapely.prepared import prep
-from itertools import cycle # For cycling through the area list
+import pyarrow.parquet as pq
+import pyarrow as pa
 
 # --- CONFIGURATION ---
 NUM_LOCATIONS = 1000
@@ -33,6 +31,7 @@ if teil_a:
 # MINI Teil b) Sensitivität
 teil_b = True
 if teil_b:
+    out_filenames = []
     for area in [25, 70, 130, 250, 400, 700, 1100]:
         mini_events_raw = gpd.read_file(MINI_SHAPEFILE_ROOT / f"Anrisskreis{area}m2.shp")
         mini_events = mini_events_raw[["RS_ID", "Anrh", "geometry"]]
@@ -66,7 +65,15 @@ if teil_b:
         df_filtered.loc[df_filtered.RS_ID == 179339]
         df_filtered.loc[:, "Anrh"] = df_filtered.Anrh_rounded
         df_filtered.drop(columns=["Anrh_rounded"], inplace=True)
+        df_filtered.loc[:, "area"] = area
 
         filename_out = CONTROL_CENTER_ROOT_DIR / "input" / f"MINI{NUM_LOCATIONS}_sensitivität_area{area}_event_manifest.parquet"
+        out_filenames.append(filename_out)
         print(f"💾 Saving MINI Teil b) Sensitivität - area {area}m2 - Parquet manifest ({n_remaining} rows): {filename_out}")
         df_filtered.to_parquet(filename_out, index=False)
+    
+    out_filenames
+    len(out_filenames)
+    table = pq.read_table(out_filenames)
+    filename_out = CONTROL_CENTER_ROOT_DIR / "input" / f"MINI{NUM_LOCATIONS}_sensitivität_areas_combined_event_manifest.parquet"
+    pq.write_table(table, filename_out)
