@@ -72,8 +72,7 @@ if teil_b:
         print(f"💾 Saving MINI Teil b) Sensitivität - area {area}m2 - Parquet manifest ({n_remaining} rows): {filename_out}")
         df_filtered.to_parquet(filename_out, index=False)
     
-    out_filenames
-    len(out_filenames)
     table = pq.read_table(out_filenames)
     filename_out = CONTROL_CENTER_ROOT_DIR / "input" / f"MINI{NUM_LOCATIONS}_sensitivität_areas_combined_event_manifest.parquet"
     pq.write_table(table, filename_out)
+    print(f"DONE: wrote teil B event manifest: {filename_out}")
