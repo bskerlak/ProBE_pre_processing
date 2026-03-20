@@ -9,8 +9,8 @@ from pathlib import Path
 # --- Configuration ---
 CSV_PATH = "/home/bojan/probe_pre_processing/data/ch.swisstopo.swissalti3d-grosses-rechteck.csv"
 TILES_DIR = "/home/bojan/probe_pre_processing/data/bern_2m_tiles"
-OUTPUT_TIF = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned_5km_buffer_COG.tif"
-OUTPUT_TIF_CROPPED = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned_5km_buffer_COG_cropped.tif"
+OUTPUT_TIF = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned_bilinear_5km_buffer_COG.tif"
+OUTPUT_TIF_CROPPED = "/home/bojan/probe_pre_processing/data/Kanton_BE_5m_aligned_bilinear_5km_buffer_COG_cropped.tif"
 
 def get_bern_extent(
     swissboundaries_gdb="/home/bojan/probe_pre_processing/data/swissboundaries/swissBOUNDARIES3D_1_5_LV95_LN02.gdb",
@@ -100,7 +100,7 @@ def create_aligned_5m_cog(input_folder, output_tif, extent):
         "gdalwarp",
         "-of", "COG",              # Change output format to COG
         "-tr", "5", "5",           # 5m resolution
-        "-r", "average",           # Downsampling method
+        "-r", "bilinear",           # Downsampling method
         "-tap",                    # Snap to 5m grid
         "-te", str(minx), str(miny), str(maxx), str(maxy), # <--- CLIP TO BUFFERED EXTENT
         "-t_srs", "EPSG:2056",
