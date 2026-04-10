@@ -12,3 +12,4 @@ data/simulation_inputs
 *.tmp
 *.gpkg
 *.txt
+*.vrt
