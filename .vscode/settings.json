@@ -1,10 +1,20 @@
 {
-    "python.defaultInterpreterPath": "/home/bojan/probe_avaframe_sda_env/bin/python",
-    "python-envs.pythonProjects": [
-        {
-            "path": ".",
-            "envManager": "ms-python.python:venv",
-            "packageManager": "ms-python.python:pip"
-        }
-    ]
+    "files.watcherExclude": {
+        "**/data/**": true,
+        "**/__pycache__/**": true,
+        "**/*.tif": true,
+        "**/*.csv": true,
+        "**/*.{asc,atx,gdbtablx,gdbtable,gdbindexes,freelist,spx,horizon,aux.xml}": true
+    },
+    "search.exclude": {
+        "**/data/**": true,
+        "**/__pycache__/**": true,
+        "**/*.{tif,csv,asc,atx,gdbtablx,gdbtable,gdbindexes,freelist,spx,horizon}": true
+    },
+    "python.analysis.exclude": [
+        "**/data/**",
+        "**/__pycache__/**"
+    ],
+    "python.analysis.indexing": false,
+    "python.analysis.diagnosticMode": "openFilesOnly"
 }

@@ -13,3 +13,5 @@ data/simulation_inputs
 *.gpkg
 *.txt
 *.vrt
+*.csv
+*.log
