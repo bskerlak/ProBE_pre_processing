@@ -61,8 +61,8 @@ print("\nReading Anriss layer from GDBs …")
 gdb_base = os.path.join(INPUT, "Xurce - MINI Teil B")
 con.execute("""
     CREATE TABLE anrisse_raw (
-        id_anriss_original INTEGER,
         id_prozessquelle   INTEGER,
+        id_anriss_original INTEGER,
         x                  DOUBLE,
         y                  DOUBLE,
         d_cm               INTEGER,
@@ -197,9 +197,9 @@ con.execute(f"""
     ) TO '{out_summary}' (HEADER, DELIMITER ',')
 """)
 rows = con.execute(f"SELECT * FROM read_csv('{out_summary}')").fetchall()
-print(f"\n  {'prozessquelle':>14}  {'area_m2':>8}  {'n_min':>6}  {'n_mean':>6}  {'n_max':>6}  {'n_total':>7}")
-for pq, area, n_min, n_mean, n_max, n_total in rows:
-    print(f"  {pq:>14}  {area:>8.0f}  {n_min:>6}  {n_mean:>6}  {n_max:>6}  {n_total:>7}")
+print(f"\n  {'prozessquelle':>14}  {'id_anriss':>14}  {'area_m2':>8}  {'n_min':>6}  {'n_mean':>6}  {'n_max':>6}  {'n_total':>7}")
+for pq, id_anriss, area, n_min, n_mean, n_max, n_total in rows:
+    print(f"  {pq:>14}  {id_anriss:>14}  {area:>8.0f}  {n_min:>6}  {n_mean:>6}  {n_max:>6}  {n_total:>7}")
 
 print("\nDone. Files written to:", OUTPUT)
 for f in sorted(os.listdir(OUTPUT)):
